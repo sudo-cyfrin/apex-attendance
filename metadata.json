@@ -1,0 +1,6 @@
+{
+  "name": "Attendance Tracker",
+  "description": "Full-stack corporate attendance tracking application with role-based access, automated leave calculations, Sunday shift compensation, and interactive calendar grids.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

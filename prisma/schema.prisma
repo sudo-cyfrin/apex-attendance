@@ -1,0 +1,129 @@
+// =============================================================================
+// Prisma Schema: Corporate Attendance Tracking & Leave Credit Allocation System
+// Database: PostgreSQL
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// -----------------------------------------------------------------------------
+// Role & Attendance Enums
+// -----------------------------------------------------------------------------
+
+enum Role {
+  EMPLOYEE
+  ADMIN
+}
+
+enum AttendanceStatus {
+  PRESENT              // Fully attended with both check-in and checkout recorded
+  CHECKED_IN          // Currently clocked in (only valid on active current day)
+  INCOMPLETE_CHECKOUT  // Clocked in but missed checkout before 23:59 (Yellow tag; excluded from avg check-in)
+  ABSENT               // Past working weekday without clock-in
+  PAID_LEAVE           // Absences 1 & 2 of current month (Orange tag) or neutralized by Sunday compensation
+  UNPAID_LEAVE         // Absences 3+ of current month (Red tag)
+  WEEKEND_OFF          // Regular unworked Sunday rest day
+  SUNDAY_WORKED        // Clocked in & out on Sunday -> generates +1 LeaveCreditAudit credit (Neon tag)
+}
+
+// -----------------------------------------------------------------------------
+// User Model
+// -----------------------------------------------------------------------------
+
+model User {
+  id              String             @id @default(uuid())
+  email           String             @unique
+  username        String             @unique
+  passwordHash    String
+  name            String
+  role            Role               @default(EMPLOYEE)
+  department      String             @default("Engineering")
+  jobTitle        String             @default("Software Engineer")
+  employeeCode    String             @unique
+  avatarUrl       String?
+  isActive        Boolean            @default(true)
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  // Relationships
+  attendanceRecords AttendanceRecord[]
+  leaveCreditAudits LeaveCreditAudit[]
+
+  @@map("users")
+}
+
+// -----------------------------------------------------------------------------
+// Attendance Record Model
+// Every attendance record is bound to a single calendar date (YYYY-MM-DD).
+// -----------------------------------------------------------------------------
+
+model AttendanceRecord {
+  id              String             @id @default(uuid())
+  userId          String
+  user            User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  // Date format: "YYYY-MM-DD" representing the calendar day
+  date            String             
+  checkInTime     DateTime?
+  checkOutTime    DateTime?
+  
+  // Computed or recorded status
+  status          AttendanceStatus   @default(PRESENT)
+  
+  // Calculated duration in decimal hours (e.g., 8.5)
+  hoursWorked     Float?             @default(0.0)
+  
+  // Whether this checkout was missed (past day with checkInTime != null, checkOutTime == null)
+  isMissingCheckout Boolean          @default(false)
+
+  // Sunday shift flag: if true, award +1 paid holiday compensation credit
+  isSundayShift   Boolean            @default(false)
+  
+  notes           String?
+  ipAddress       String?
+  deviceInfo      String?
+
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  // Enforce unique record per employee per calendar date
+  @@unique([userId, date], name: "user_date_unique")
+  @@index([userId, date])
+  @@index([status])
+  @@map("attendance_records")
+}
+
+// -----------------------------------------------------------------------------
+// Leave Credit Audit Model
+// Logs Sunday shift compensations and their offset against weekday absences.
+// -----------------------------------------------------------------------------
+
+model LeaveCreditAudit {
+  id                  String    @id @default(uuid())
+  userId              String
+  user                User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  // The Sunday shift that generated this credit (YYYY-MM-DD)
+  sourceSundayDate    String
+  
+  // Default credit is +1 paid holiday
+  creditAmount        Int       @default(1)
+  
+  // Description/audit reason (e.g., "Sunday shift completed with valid check-in and check-out")
+  reason              String
+  
+  // The weekday absence neutralized by this credit (YYYY-MM-DD), if assigned
+  appliedToLeaveDate  String?
+  
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  @@index([userId])
+  @@map("leave_credit_audits")
+}
