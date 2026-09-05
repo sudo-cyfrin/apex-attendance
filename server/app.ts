@@ -7,11 +7,11 @@ import path from 'path';
 import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
 
-import { SEED_USERS, INITIAL_RECORDS } from './server/store.ts';
-import { db } from './server/firebaseAdmin.ts';
+import { SEED_USERS, INITIAL_RECORDS } from './store.ts';
+import { db } from './firebaseAdmin.ts';
 
-import { User, AttendanceRecord, Role } from './src/types.ts';
-import { evaluateMonthlyAttendance } from './src/utils/attendanceCalculations.ts';
+import { User, AttendanceRecord, Role } from '../src/types.ts';
+import { evaluateMonthlyAttendance } from '../src/utils/attendanceCalculations.ts';
 
 const app = express();
 const PORT = 3000;
@@ -29,70 +29,98 @@ const attendanceCollection = db.collection('attendance_records');
 // Firestore is the persistent source of truth.
 // These arrays are kept so the rest of the existing application needs
 // minimal changes.
-let users: User[] = [];
-let records: AttendanceRecord[] = [];
+type FirestoreCache = {
+  users: User[];
+  records: AttendanceRecord[];
+  ready: Promise<void> | null;
+};
+
+const globalForFirestore =
+  globalThis as typeof globalThis & {
+    __apexFirestoreCache?: FirestoreCache;
+  };
+
+const firestoreCache =
+  globalForFirestore.__apexFirestoreCache ??
+  (globalForFirestore.__apexFirestoreCache = {
+    users: [],
+    records: [],
+    ready: null,
+  });
+
+let users = firestoreCache.users;
+let records = firestoreCache.records;
 
 // Prevent multiple simultaneous Firestore initializations.
-let firestoreReady: Promise<void> | null = null;
+firestoreCache.ready
 
 // Load users and attendance records from Firestore.
 async function loadFirestoreData(): Promise<void> {
   console.log('[Firestore] Loading data...');
 
-  const [usersSnapshot, recordsSnapshot] = await Promise.all([
-    usersCollection.get(),
-    attendanceCollection.get(),
-  ]);
+  const [usersSnapshot, recordsSnapshot] =
+    await Promise.all([
+      usersCollection.get(),
+      attendanceCollection.get(),
+    ]);
 
-  users = usersSnapshot.docs.map((doc) => ({
+  const loadedUsers = usersSnapshot.docs.map((doc) => ({
     id: doc.id,
     ...doc.data(),
   })) as User[];
 
-  records = recordsSnapshot.docs.map((doc) => ({
-    id: doc.id,
-    ...doc.data(),
-  })) as AttendanceRecord[];
+  const loadedRecords =
+    recordsSnapshot.docs.map((doc) => ({
+      id: doc.id,
+      ...doc.data(),
+    })) as AttendanceRecord[];
 
-  // ---------------------------------------------------------------------------
-  // Seed users only when Firestore is empty
-  // ---------------------------------------------------------------------------
+  users = loadedUsers;
+  records = loadedRecords;
 
+  // Keep the global cache synchronized.
+  firestoreCache.users = users;
+  firestoreCache.records = records;
+
+  // Seed users only when Firestore is empty.
   if (users.length === 0 && SEED_USERS.length > 0) {
     const batch = db.batch();
 
     for (const user of SEED_USERS) {
-      batch.set(usersCollection.doc(user.id), user);
+      batch.set(
+        usersCollection.doc(user.id),
+        user
+      );
     }
 
     await batch.commit();
 
     users = [...SEED_USERS];
-
-    console.log(`[Firestore] Seeded ${users.length} users.`);
   }
 
-  // ---------------------------------------------------------------------------
-  // Seed attendance only when Firestore is empty
-  // ---------------------------------------------------------------------------
-
-  if (records.length === 0 && INITIAL_RECORDS.length > 0) {
+  // Seed attendance only when Firestore is empty.
+  if (
+    records.length === 0 &&
+    INITIAL_RECORDS.length > 0
+  ) {
     const batch = db.batch();
 
     for (const record of INITIAL_RECORDS) {
-      batch.set(attendanceCollection.doc(record.id), record);
+      batch.set(
+        attendanceCollection.doc(record.id),
+        record
+      );
     }
 
     await batch.commit();
 
     records = [...INITIAL_RECORDS];
-
-    console.log(
-      `[Firestore] Seeded ${records.length} attendance records.`
-    );
   }
 
   users = deduplicateUsers(users);
+
+  firestoreCache.users = users;
+  firestoreCache.records = records;
 
   console.log(
     `[Firestore] Loaded ${users.length} users and ${records.length} attendance records.`
@@ -101,11 +129,15 @@ async function loadFirestoreData(): Promise<void> {
 
 // Ensure Firestore is initialized before a request accesses users/records.
 async function ensureFirestoreLoaded(): Promise<void> {
-  if (!firestoreReady) {
-    firestoreReady = loadFirestoreData();
+  if (!firestoreCache.ready) {
+    firestoreCache.ready = loadFirestoreData().catch((err) => {
+      // Allow a future request to retry if initialization fails.
+      firestoreCache.ready = null;
+      throw err;
+    });
   }
 
-  await firestoreReady;
+  await firestoreCache.ready;
 }
 
 // =============================================================================
@@ -172,12 +204,15 @@ async function deleteMatchingAttendanceRecords(
 // FIRESTORE INITIALIZATION MIDDLEWARE
 // =============================================================================
 
-app.use(async (req, res, next) => {
+app.use('/api', async (req, res, next) => {
   try {
     await ensureFirestoreLoaded();
     next();
   } catch (err) {
-    console.error('[Firestore] Initialization error:', err);
+    console.error(
+      '[Firestore] Initialization error:',
+      err
+    );
 
     res.status(500).json({
       error: 'Database initialization failed',
@@ -2180,55 +2215,30 @@ app.get(
 export default app;
 
 async function startServer() {
-  const vite =
-    await createViteServer({
-      server: {
-        middlewareMode:
-          true,
-      },
+  const vite = await createViteServer({
+    server: {
+      middlewareMode: true,
+    },
+    appType: 'spa',
+  });
 
-      appType:
-        'spa',
-    });
+  app.use(vite.middlewares);
 
-  app.use(
-    vite.middlewares
-  );
-
-  app.listen(
-    PORT,
-    '0.0.0.0',
-    () => {
-      console.log(
-        `[Attendance Tracker] Server listening on http://localhost:${PORT}`
-      );
-    }
-  );
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(
+      `[Attendance Tracker] Server listening on http://localhost:${PORT}`
+    );
+  });
 }
 
-// =============================================================================
-// START SERVER
-// =============================================================================
-
-// Local development:
-// Load Firestore first, then start Express + Vite.
-//
-// Vercel:
-// Do NOT call listen().
-// Vercel imports `app` directly.
 if (
-  process.env.VERCEL !== '1'
+  process.env.LOCAL_SERVER === 'true' &&
+  !process.env.VERCEL
 ) {
   ensureFirestoreLoaded()
-    .then(() =>
-      startServer()
-    )
+    .then(() => startServer())
     .catch((err) => {
-      console.error(
-        '[Firestore] Failed to initialize:',
-        err
-      );
-
+      console.error('[Firestore] Failed to initialize:', err);
       process.exit(1);
     });
 }

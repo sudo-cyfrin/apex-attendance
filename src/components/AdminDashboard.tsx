@@ -81,74 +81,39 @@ export const AdminDashboard: React.FC = () => {
     setLoading(true);
 
     try {
-      // 1. Synchronize existing users from Firestore
-      try {
-        const usersSnap = await getDocs(collection(db, 'users'));
-        const firestoreUsers: User[] = [];
-
-        usersSnap.forEach((docSnap) => {
-          const u = docSnap.data() as User;
-
-          if (u && (u.id || u.email)) {
-            firestoreUsers.push({
-              ...u,
-              id: u.id || docSnap.id,
-            });
-          }
-        });
-
-        if (firestoreUsers.length > 0) {
-          await fetch('/api/admin/sync-all-users', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'x-user-role': currentUser.role,
-            },
-            body: JSON.stringify({
-              users: firestoreUsers,
-            }),
-          });
-        }
-      } catch (fsErr) {
-        console.warn(
-          'Firestore direct user sync notice:',
-          fsErr
-        );
-      }
-
-      // 2. Fetch computed evaluation summaries
       const res = await fetch('/api/admin/employees', {
         headers: {
           'x-user-role': currentUser.role,
         },
       });
 
-      if (res.ok) {
-        const data = await res.json();
-        const rawList = data.employees || [];
-
-        // Deduplicate to guarantee no duplicate employee rows
-        const seen = new Set<string>();
-
-        const deduped = rawList.filter((item: any) => {
-          const key = (
-            item.user?.email ||
-            item.user?.id ||
-            ''
-          )
-            .toLowerCase()
-            .trim();
-
-          if (!key || seen.has(key)) {
-            return false;
-          }
-
-          seen.add(key);
-          return true;
-        });
-
-        setEmployees(deduped);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
       }
+
+      const data = await res.json();
+      const rawList = data.employees || [];
+
+      const seen = new Set<string>();
+
+      const deduped = rawList.filter((item: any) => {
+        const key = (
+          item.user?.email ||
+          item.user?.id ||
+          ''
+        )
+          .toLowerCase()
+          .trim();
+
+        if (!key || seen.has(key)) {
+          return false;
+        }
+
+        seen.add(key);
+        return true;
+      });
+
+      setEmployees(deduped);
     } catch (err) {
       console.error(
         'Failed to load admin employees:',

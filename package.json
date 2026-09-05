@@ -4,9 +4,9 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "tsx app.ts",
+    "dev": "tsx server/app.ts",
     "build": "vite build",
-    "start": "node app.ts",
+    "start": "node server/app.ts",
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit"

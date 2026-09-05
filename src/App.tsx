@@ -310,28 +310,6 @@ function AttendanceApp() {
   }, [isAdmin, currentTab]);
 
   // ============================================================
-  // SYNC AUTHENTICATED USER TO SERVER STORE
-  // ============================================================
-  useEffect(() => {
-    if (currentUser) {
-      fetch('/api/auth/sync-user', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          user: currentUser,
-        }),
-      }).catch((err) => {
-        console.error(
-          'Failed to sync user to server:',
-          err
-        );
-      });
-    }
-  }, [currentUser]);
-
-  // ============================================================
   // FETCH MONTH DATA
   //
   // IMPORTANT:
