@@ -7,11 +7,11 @@ import path from 'path';
 import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
 
-import { SEED_USERS, INITIAL_RECORDS } from './store.ts';
-import { db } from './firebaseAdmin.ts';
+import { SEED_USERS, INITIAL_RECORDS } from './store';
+import { db } from './firebaseAdmin';
 
-import { User, AttendanceRecord, Role } from '../src/types.ts';
-import { evaluateMonthlyAttendance } from '../src/utils/attendanceCalculations.ts';
+import { User, AttendanceRecord, Role } from '../src/types';
+import { evaluateMonthlyAttendance } from '../src/utils/attendanceCalculations';
 
 const app = express();
 const PORT = 3000;
