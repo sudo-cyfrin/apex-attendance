@@ -224,7 +224,14 @@ export function evaluateMonthlyAttendance(
   todayDateStr: string // "YYYY-MM-DD"
 ): MonthEvaluationResult {
   const daysInMonth = new Date(year, month, 0).getDate();
-  const today = new Date(todayDateStr);
+
+  // Parse YYYY-MM-DD as a LOCAL calendar date.
+  // Do NOT use new Date("YYYY-MM-DD") because that is interpreted as UTC.
+  const [todayYear, todayMonth, todayDay] = todayDateStr
+    .split('-')
+    .map(Number);
+
+  const today = new Date(todayYear, todayMonth - 1, todayDay);
   today.setHours(0, 0, 0, 0);
 
   // Step 1: Detect Sunday shifts worked (valid check-in & check-out)
@@ -301,8 +308,8 @@ export function evaluateMonthlyAttendance(
     }
 
     const isToday = dateStr === todayDateStr;
-    const isPast = curDate < today;
-    const isFuture = curDate > today;
+    const isPast = dateStr < todayDateStr;
+    const isFuture = dateStr > todayDateStr;
 
     const record = recordsMap.get(dateStr);
 

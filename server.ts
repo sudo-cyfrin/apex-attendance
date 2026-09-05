@@ -1,8 +1,15 @@
+import dotenv from 'dotenv';
+
+dotenv.config({ path: '.env.local' });
+
 import express, { Request, Response } from 'express';
 import path from 'path';
 import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
+
 import { SEED_USERS, INITIAL_RECORDS } from './server/store.ts';
+import { db } from './server/firebaseAdmin.ts';
+
 import { User, AttendanceRecord, Role } from './src/types.ts';
 import { evaluateMonthlyAttendance } from './src/utils/attendanceCalculations.ts';
 
@@ -11,20 +18,189 @@ const PORT = 3000;
 
 app.use(express.json());
 
-// In-Memory Database Store
-let users: User[] = [...SEED_USERS];
-let records: AttendanceRecord[] = [...INITIAL_RECORDS];
+// =============================================================================
+// FIRESTORE
+// =============================================================================
 
-// Firebase API Key loaded from firebase-applet-config.json
-let firebaseApiKey = 'AIzaSyCq6OifhBNBUKdgBv9UVclxJoeG8UM-lmc';
-try {
-  const cfg = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'firebase-applet-config.json'), 'utf-8'));
-  if (cfg.apiKey) firebaseApiKey = cfg.apiKey;
-} catch (e) {
-  // Use default
+const usersCollection = db.collection('users');
+const attendanceCollection = db.collection('attendance_records');
+
+// Firestore-backed local cache.
+// Firestore is the persistent source of truth.
+// These arrays are kept so the rest of the existing application needs
+// minimal changes.
+let users: User[] = [];
+let records: AttendanceRecord[] = [];
+
+// Prevent multiple simultaneous Firestore initializations.
+let firestoreReady: Promise<void> | null = null;
+
+// Load users and attendance records from Firestore.
+async function loadFirestoreData(): Promise<void> {
+  console.log('[Firestore] Loading data...');
+
+  const [usersSnapshot, recordsSnapshot] = await Promise.all([
+    usersCollection.get(),
+    attendanceCollection.get(),
+  ]);
+
+  users = usersSnapshot.docs.map((doc) => ({
+    id: doc.id,
+    ...doc.data(),
+  })) as User[];
+
+  records = recordsSnapshot.docs.map((doc) => ({
+    id: doc.id,
+    ...doc.data(),
+  })) as AttendanceRecord[];
+
+  // ---------------------------------------------------------------------------
+  // Seed users only when Firestore is empty
+  // ---------------------------------------------------------------------------
+
+  if (users.length === 0 && SEED_USERS.length > 0) {
+    const batch = db.batch();
+
+    for (const user of SEED_USERS) {
+      batch.set(usersCollection.doc(user.id), user);
+    }
+
+    await batch.commit();
+
+    users = [...SEED_USERS];
+
+    console.log(`[Firestore] Seeded ${users.length} users.`);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Seed attendance only when Firestore is empty
+  // ---------------------------------------------------------------------------
+
+  if (records.length === 0 && INITIAL_RECORDS.length > 0) {
+    const batch = db.batch();
+
+    for (const record of INITIAL_RECORDS) {
+      batch.set(attendanceCollection.doc(record.id), record);
+    }
+
+    await batch.commit();
+
+    records = [...INITIAL_RECORDS];
+
+    console.log(
+      `[Firestore] Seeded ${records.length} attendance records.`
+    );
+  }
+
+  users = deduplicateUsers(users);
+
+  console.log(
+    `[Firestore] Loaded ${users.length} users and ${records.length} attendance records.`
+  );
 }
 
-// Master Admin profile for user's email
+// Ensure Firestore is initialized before a request accesses users/records.
+async function ensureFirestoreLoaded(): Promise<void> {
+  if (!firestoreReady) {
+    firestoreReady = loadFirestoreData();
+  }
+
+  await firestoreReady;
+}
+
+// =============================================================================
+// FIRESTORE WRITE HELPERS
+// =============================================================================
+
+async function saveUser(user: User): Promise<void> {
+  await usersCollection.doc(user.id).set(user, {
+    merge: true,
+  });
+}
+
+async function saveAttendanceRecord(
+  record: AttendanceRecord
+): Promise<void> {
+  await attendanceCollection.doc(record.id).set(record, {
+    merge: true,
+  });
+}
+
+async function deleteAttendanceRecord(recordId: string): Promise<void> {
+  await attendanceCollection.doc(recordId).delete();
+}
+
+async function deleteAllAttendance(): Promise<void> {
+  const snapshot = await attendanceCollection.get();
+
+  if (snapshot.empty) {
+    return;
+  }
+
+  const batch = db.batch();
+
+  snapshot.docs.forEach((doc) => {
+    batch.delete(doc.ref);
+  });
+
+  await batch.commit();
+}
+
+// Delete attendance records matching a predicate.
+// Useful for the existing alias-aware reset functionality.
+async function deleteMatchingAttendanceRecords(
+  predicate: (record: AttendanceRecord) => boolean
+): Promise<number> {
+  const matchingRecords = records.filter(predicate);
+
+  if (matchingRecords.length === 0) {
+    return 0;
+  }
+
+  const batch = db.batch();
+
+  for (const record of matchingRecords) {
+    batch.delete(attendanceCollection.doc(record.id));
+  }
+
+  await batch.commit();
+
+  return matchingRecords.length;
+}
+
+// =============================================================================
+// FIRESTORE INITIALIZATION MIDDLEWARE
+// =============================================================================
+
+app.use(async (req, res, next) => {
+  try {
+    await ensureFirestoreLoaded();
+    next();
+  } catch (err) {
+    console.error('[Firestore] Initialization error:', err);
+
+    res.status(500).json({
+      error: 'Database initialization failed',
+    });
+  }
+});
+
+// =============================================================================
+// FIREBASE API KEY
+// =============================================================================
+
+const firebaseApiKey = process.env.FIREBASE_API_KEY;
+
+if (!firebaseApiKey) {
+  console.warn(
+    '[Firebase] FIREBASE_API_KEY environment variable is not configured.'
+  );
+}
+
+// =============================================================================
+// DEFAULT ADMIN
+// =============================================================================
+
 const DEFAULT_ADMIN_USER: User = {
   id: 'admin_shadowcyfrin007',
   email: 'shadowcyfrin007@gmail.com',
@@ -33,75 +209,132 @@ const DEFAULT_ADMIN_USER: User = {
   department: 'Executive Operations',
   jobTitle: 'Director of Operations & Admin',
   employeeCode: 'ADMIN-001',
-  avatarUrl: 'https://api.dicebear.com/7.x/bottts/svg?seed=shadowcyfrin007',
+  avatarUrl:
+    'https://api.dicebear.com/7.x/bottts/svg?seed=shadowcyfrin007',
   joinedDate: '2026-01-01',
 };
 
-// Seed admin if not present
-users = deduplicateUsers(users);
+// =============================================================================
+// USER HELPERS
+// =============================================================================
 
-// Helper to deduplicate users by ID and email (case-insensitive)
+// Helper to deduplicate users by ID and email.
 export function deduplicateUsers(list: User[]): User[] {
   const seenIds = new Set<string>();
   const seenEmails = new Set<string>();
+
   const result: User[] = [];
 
   for (const u of list) {
     if (!u) continue;
-    const emailKey = u.email ? u.email.trim().toLowerCase() : '';
-    const idKey = u.id ? u.id.trim() : '';
 
-    if (idKey && seenIds.has(idKey)) continue;
-    if (emailKey && seenEmails.has(emailKey)) continue;
+    const emailKey = u.email
+      ? u.email.trim().toLowerCase()
+      : '';
 
-    if (idKey) seenIds.add(idKey);
-    if (emailKey) seenEmails.add(emailKey);
+    const idKey = u.id
+      ? u.id.trim()
+      : '';
+
+    if (idKey && seenIds.has(idKey)) {
+      continue;
+    }
+
+    if (emailKey && seenEmails.has(emailKey)) {
+      continue;
+    }
+
+    if (idKey) {
+      seenIds.add(idKey);
+    }
+
+    if (emailKey) {
+      seenEmails.add(emailKey);
+    }
+
     result.push(u);
   }
+
   return result;
 }
 
-// Helper to upsert a user into the in-memory store without creating duplicate records
-export function upsertUser(incoming: User): User {
-  if (!incoming) return incoming;
-  const cleanEmail = incoming.email ? incoming.email.trim().toLowerCase() : '';
-  const incomingId = incoming.id ? incoming.id.trim() : '';
+// Upsert user into local cache AND Firestore.
+export async function upsertUser(
+  incoming: User
+): Promise<User> {
+  if (!incoming) {
+    return incoming;
+  }
+
+  const cleanEmail = incoming.email
+    ? incoming.email.trim().toLowerCase()
+    : '';
+
+  const incomingId = incoming.id
+    ? incoming.id.trim()
+    : '';
 
   const idx = users.findIndex(
     (u) =>
       (incomingId && u.id === incomingId) ||
-      (cleanEmail && u.email && u.email.trim().toLowerCase() === cleanEmail)
+      (
+        cleanEmail &&
+        u.email &&
+        u.email.trim().toLowerCase() === cleanEmail
+      )
   );
+
+  let savedUser: User;
 
   if (idx !== -1) {
     const existing = users[idx];
-    // Preserve real Firebase UID over placeholder ID
+
+    // Preserve real Firebase UID over placeholder IDs.
     const preferredId =
-      incomingId && !incomingId.startsWith('admin_') && !incomingId.startsWith('usr_')
+      incomingId &&
+      !incomingId.startsWith('admin_') &&
+      !incomingId.startsWith('usr_')
         ? incomingId
         : existing.id || incomingId;
 
-    users[idx] = {
+    savedUser = {
       ...existing,
       ...incoming,
       id: preferredId,
     };
+
+    users[idx] = savedUser;
   } else {
-    users.push(incoming);
+    savedUser = incoming;
+    users.push(savedUser);
   }
 
   users = deduplicateUsers(users);
+
+  // Persist to Firestore.
+  await saveUser(savedUser);
+
   return (
     users.find(
       (u) =>
         (incomingId && u.id === incomingId) ||
-        (cleanEmail && u.email && u.email.trim().toLowerCase() === cleanEmail)
-    ) || incoming
+        (
+          cleanEmail &&
+          u.email &&
+          u.email.trim().toLowerCase() === cleanEmail
+        )
+    ) || savedUser
   );
 }
 
-// Calculate current date in Indian Standard Time (IST, UTC+5:30)
-export function getISTDateString(d = new Date()): string {
+// =============================================================================
+// DATE HELPERS
+// =============================================================================
+
+// Calculate current date in Indian Standard Time.
+export function getISTDateString(
+  d = new Date()
+): string {
   return new Intl.DateTimeFormat('en-CA', {
     timeZone: 'Asia/Kolkata',
     year: 'numeric',
@@ -110,749 +343,1892 @@ export function getISTDateString(d = new Date()): string {
   }).format(d);
 }
 
-// Portal Launch Date: operations start on September 4, 2026 in IST
+// Portal launch date.
 export const SYSTEM_LAUNCH_DATE = '2026-09-04';
 
-// Active system date (starts on September 4, 2026 - Launch Day)
-let systemTodayDate = SYSTEM_LAUNCH_DATE;
+// Active system date.
+let systemTodayDate = getISTDateString();
 
-// Helper to find a record for user using alias-aware matching (UID, email, or employee code)
-function findRecordForUser(userId: string, date: string): AttendanceRecord | undefined {
-  const cleanId = (userId || '').trim().toLowerCase();
+// =============================================================================
+// ATTENDANCE HELPERS
+// =============================================================================
+
+// Find a record for a user using UID, email, or employee code.
+function findRecordForUser(
+  userId: string,
+  date: string
+): AttendanceRecord | undefined {
+  const cleanId = (userId || '')
+    .trim()
+    .toLowerCase();
+
   const targetUser = users.find(
     (u) =>
       u.id.toLowerCase() === cleanId ||
       u.email.toLowerCase() === cleanId ||
-      (u.employeeCode && u.employeeCode.toLowerCase() === cleanId)
+      (
+        u.employeeCode &&
+        u.employeeCode.toLowerCase() === cleanId
+      )
   );
 
   const matchingIds = new Set<string>([cleanId]);
+
   if (targetUser) {
     matchingIds.add(targetUser.id.toLowerCase());
     matchingIds.add(targetUser.email.toLowerCase());
-    if (targetUser.employeeCode) matchingIds.add(targetUser.employeeCode.toLowerCase());
+
+    if (targetUser.employeeCode) {
+      matchingIds.add(
+        targetUser.employeeCode.toLowerCase()
+      );
+    }
+
     users
-      .filter((u) => u.email.toLowerCase() === targetUser.email.toLowerCase())
+      .filter(
+        (u) =>
+          u.email.toLowerCase() ===
+          targetUser.email.toLowerCase()
+      )
       .forEach((u) => {
         matchingIds.add(u.id.toLowerCase());
-        if (u.employeeCode) matchingIds.add(u.employeeCode.toLowerCase());
+
+        if (u.employeeCode) {
+          matchingIds.add(
+            u.employeeCode.toLowerCase()
+          );
+        }
       });
   }
 
   return records.find(
-    (r) => matchingIds.has((r.userId || '').toLowerCase()) && r.date === date
+    (r) =>
+      matchingIds.has(
+        (r.userId || '').toLowerCase()
+      ) &&
+      r.date === date
   );
 }
 
-// Helper to get records map for an employee (strictly launch date onwards, alias-aware)
-function getEmployeeRecordsMap(userId: string): Map<string, AttendanceRecord> {
+// Get records map for an employee.
+function getEmployeeRecordsMap(
+  userId: string
+): Map<string, AttendanceRecord> {
   const map = new Map<string, AttendanceRecord>();
-  const cleanId = (userId || '').trim().toLowerCase();
+
+  const cleanId = (userId || '')
+    .trim()
+    .toLowerCase();
+
   const targetUser = users.find(
     (u) =>
       u.id.toLowerCase() === cleanId ||
       u.email.toLowerCase() === cleanId ||
-      (u.employeeCode && u.employeeCode.toLowerCase() === cleanId)
+      (
+        u.employeeCode &&
+        u.employeeCode.toLowerCase() === cleanId
+      )
   );
 
   const matchingIds = new Set<string>([cleanId]);
+
   if (targetUser) {
     matchingIds.add(targetUser.id.toLowerCase());
     matchingIds.add(targetUser.email.toLowerCase());
-    if (targetUser.employeeCode) matchingIds.add(targetUser.employeeCode.toLowerCase());
+
+    if (targetUser.employeeCode) {
+      matchingIds.add(
+        targetUser.employeeCode.toLowerCase()
+      );
+    }
+
     users
-      .filter((u) => u.email.toLowerCase() === targetUser.email.toLowerCase())
+      .filter(
+        (u) =>
+          u.email.toLowerCase() ===
+          targetUser.email.toLowerCase()
+      )
       .forEach((u) => {
         matchingIds.add(u.id.toLowerCase());
-        if (u.employeeCode) matchingIds.add(u.employeeCode.toLowerCase());
+
+        if (u.employeeCode) {
+          matchingIds.add(
+            u.employeeCode.toLowerCase()
+          );
+        }
       });
   }
 
   records
-    .filter((r) => matchingIds.has((r.userId || '').toLowerCase()) && r.date >= SYSTEM_LAUNCH_DATE)
+    .filter(
+      (r) =>
+        matchingIds.has(
+          (r.userId || '').toLowerCase()
+        ) &&
+        r.date >= SYSTEM_LAUNCH_DATE
+    )
     .forEach((r) => {
       map.set(r.date, r);
     });
+
   return map;
 }
 
 // =============================================================================
-// API Routes
+// API ROUTES
 // =============================================================================
 
-// Health check
-app.get('/api/health', (req: Request, res: Response) => {
-  res.json({ status: 'ok', serverTime: new Date().toISOString(), systemTodayDate });
-});
+// -----------------------------------------------------------------------------
+// Health Check
+// -----------------------------------------------------------------------------
 
-// Get demo accounts for quick one-click testing
-app.get('/api/auth/users', (req: Request, res: Response) => {
-  users = deduplicateUsers(users);
-  res.json(users);
-});
-
-// Google Login Proxy Endpoint (immune to iframe pop-up / third-party cookie restrictions)
-app.post('/api/auth/google', (req: Request, res: Response) => {
-  const { email, name, avatarUrl } = req.body;
-  const userEmail = (email || 'shadowcyfrin007@gmail.com').trim().toLowerCase();
-  const isAdmin = userEmail === 'shadowcyfrin007@gmail.com';
-
-  let foundUser = users.find((u) => u.email.toLowerCase() === userEmail);
-  if (!foundUser) {
-    foundUser = upsertUser({
-      id: isAdmin ? 'admin_shadowcyfrin007' : `usr_${Date.now()}`,
-      email: userEmail,
-      name: name || (isAdmin ? 'Shadow Cyfrin' : userEmail.split('@')[0]),
-      role: isAdmin ? 'ADMIN' : 'EMPLOYEE',
-      department: isAdmin ? 'Executive Operations' : 'Engineering',
-      jobTitle: isAdmin ? 'Director of Operations' : 'Senior Specialist',
-      employeeCode: isAdmin ? 'EMP-NNWDC' : `EMP-${Math.floor(1000 + Math.random() * 9000)}`,
-      avatarUrl: avatarUrl || `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(userEmail)}`,
-      joinedDate: '2026-09-01',
-    });
-  } else {
-    foundUser = upsertUser({
-      ...foundUser,
-      name: name || foundUser.name,
-      avatarUrl: avatarUrl || foundUser.avatarUrl,
+app.get(
+  '/api/health',
+  (req: Request, res: Response) => {
+    res.json({
+      status: 'ok',
+      serverTime: new Date().toISOString(),
+      systemTodayDate,
     });
   }
+);
 
-  res.json({
-    success: true,
-    user: foundUser,
-    token: `token_${foundUser.id}_${Date.now()}`,
-  });
-});
+// -----------------------------------------------------------------------------
+// Demo Accounts
+// -----------------------------------------------------------------------------
 
-// Password Reset Proxy Endpoint (immune to iframe network-request-failed restrictions)
-app.post('/api/auth/reset-password', async (req: Request, res: Response) => {
-  const { email } = req.body;
-  if (!email) {
-    return res.status(400).json({ error: 'Email is required' });
+app.get(
+  '/api/auth/users',
+  (req: Request, res: Response) => {
+    users = deduplicateUsers(users);
+    res.json(users);
   }
+);
 
-  try {
-    const fbRes = await fetch(
-      `https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=${firebaseApiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          requestType: 'PASSWORD_RESET',
-          email: email.trim(),
-        }),
-      }
+// -----------------------------------------------------------------------------
+// Google Login Proxy
+// -----------------------------------------------------------------------------
+
+app.post(
+  '/api/auth/google',
+  async (req: Request, res: Response) => {
+    const { email, name, avatarUrl } = req.body;
+
+    const userEmail = (
+      email ||
+      'shadowcyfrin007@gmail.com'
+    )
+      .trim()
+      .toLowerCase();
+
+    const isAdmin =
+      userEmail === 'shadowcyfrin007@gmail.com';
+
+    let foundUser = users.find(
+      (u) =>
+        u.email.toLowerCase() === userEmail
     );
-    const fbData: any = await fbRes.json();
-    if (!fbRes.ok) {
-      console.warn('Firebase reset password response:', fbData);
-      const errMsg = fbData?.error?.message || 'Failed to send password reset email';
-      return res.status(400).json({ error: errMsg });
+
+    if (!foundUser) {
+      foundUser = await upsertUser({
+        id: isAdmin
+          ? 'admin_shadowcyfrin007'
+          : `usr_${Date.now()}`,
+
+        email: userEmail,
+
+        name:
+          name ||
+          (
+            isAdmin
+              ? 'Shadow Cyfrin'
+              : userEmail.split('@')[0]
+          ),
+
+        role: isAdmin
+          ? 'ADMIN'
+          : 'EMPLOYEE',
+
+        department: isAdmin
+          ? 'Executive Operations'
+          : 'Engineering',
+
+        jobTitle: isAdmin
+          ? 'Director of Operations'
+          : 'Senior Specialist',
+
+        employeeCode: isAdmin
+          ? 'EMP-NNWDC'
+          : `EMP-${Math.floor(
+              1000 + Math.random() * 9000
+            )}`,
+
+        avatarUrl:
+          avatarUrl ||
+          `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(
+            userEmail
+          )}`,
+
+        joinedDate: '2026-09-01',
+      });
+    } else {
+      foundUser = await upsertUser({
+        ...foundUser,
+        name:
+          name || foundUser.name,
+        avatarUrl:
+          avatarUrl || foundUser.avatarUrl,
+      });
     }
 
     res.json({
       success: true,
-      message: `Password reset email sent to ${email.trim()}! Please check your inbox.`,
+      user: foundUser,
+      token: `token_${foundUser.id}_${Date.now()}`,
     });
-  } catch (err: any) {
-    console.error('Server error resetting password:', err);
-    res.status(500).json({ error: err.message || 'Internal error sending reset email' });
   }
-});
+);
 
-// Registration Proxy Endpoint (Admin account creation strictly restricted)
-app.post('/api/auth/register', async (req: Request, res: Response) => {
-  const { email, password, name, department } = req.body;
-  if (!email) {
-    return res.status(400).json({ error: 'Email is required' });
-  }
+// -----------------------------------------------------------------------------
+// Password Reset
+// -----------------------------------------------------------------------------
 
-  const cleanEmail = email.trim().toLowerCase();
-  const isAdmin = cleanEmail === 'shadowcyfrin007@gmail.com';
-  const role: Role = isAdmin ? 'ADMIN' : 'EMPLOYEE';
+app.post(
+  '/api/auth/reset-password',
+  async (req: Request, res: Response) => {
+    const { email } = req.body;
 
-  let existing = users.find((u) => u.email.toLowerCase() === cleanEmail);
-  if (existing) {
-    return res.json({ success: true, user: existing });
-  }
-
-  const newUser: User = {
-    id: isAdmin && cleanEmail === 'shadowcyfrin007@gmail.com' ? 'admin_shadowcyfrin007' : `usr_${Date.now()}`,
-    email: cleanEmail,
-    name: name || (isAdmin ? 'Administrator' : cleanEmail.split('@')[0]),
-    role,
-    department: department || (isAdmin ? 'Executive Operations' : 'General'),
-    jobTitle: isAdmin ? 'System Administrator' : 'Team Member',
-    employeeCode: isAdmin ? `ADM-${Math.floor(100 + Math.random() * 900)}` : `EMP-${Math.floor(1000 + Math.random() * 9000)}`,
-    avatarUrl: `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(cleanEmail)}`,
-    joinedDate: systemTodayDate,
-  };
-
-  users.push(newUser);
-
-  // Attempt Firebase accounts:signUp in background (ignore if exists)
-  try {
-    await fetch(
-      `https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${firebaseApiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: cleanEmail,
-          password: password || 'ApexPass#2026',
-          returnSecureToken: true,
-        }),
-      }
-    );
-  } catch (e) {
-    // Ignore error
-  }
-
-  res.json({ success: true, user: newUser });
-});
-
-// Login endpoint (strictly authenticates via Firebase Identity Toolkit)
-app.post('/api/auth/login', async (req: Request, res: Response) => {
-  const { identifier, password } = req.body;
-  if (!identifier || !password) {
-    return res.status(400).json({ error: 'Corporate email and password are required' });
-  }
-
-  const cleanIdent = identifier.trim().toLowerCase();
-
-  // Strictly authenticate against Firebase Identity Toolkit REST API
-  try {
-    const fbRes = await fetch(
-      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${firebaseApiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: cleanIdent,
-          password: password,
-          returnSecureToken: true,
-        }),
-      }
-    );
-    const fbData: any = await fbRes.json();
-    if (!fbRes.ok || !fbData.localId) {
-      const errMsg = fbData?.error?.message;
-      if (errMsg === 'EMAIL_NOT_FOUND') {
-        return res.status(401).json({ error: 'No account found with this corporate email. Please register or check your email.' });
-      }
-      if (errMsg === 'INVALID_PASSWORD' || errMsg === 'INVALID_LOGIN_CREDENTIALS') {
-        return res.status(401).json({ error: 'Invalid password. Please check your credentials or reset your password.' });
-      }
-      if (errMsg === 'USER_DISABLED') {
-        return res.status(403).json({ error: 'This corporate account has been disabled.' });
-      }
-      return res.status(401).json({ error: 'Invalid corporate email or password. Access denied.' });
+    if (!email) {
+      return res.status(400).json({
+        error: 'Email is required',
+      });
     }
 
-    // Password verified! Find existing record or construct profile
-    let foundUser = users.find(
+    try {
+      const fbRes = await fetch(
+        `https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=${firebaseApiKey}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            requestType: 'PASSWORD_RESET',
+            email: email.trim(),
+          }),
+        }
+      );
+
+      const fbData: any =
+        await fbRes.json();
+
+      if (!fbRes.ok) {
+        console.warn(
+          'Firebase reset password response:',
+          fbData
+        );
+
+        const errMsg =
+          fbData?.error?.message ||
+          'Failed to send password reset email';
+
+        return res.status(400).json({
+          error: errMsg,
+        });
+      }
+
+      res.json({
+        success: true,
+        message: `Password reset email sent to ${email.trim()}! Please check your inbox.`,
+      });
+    } catch (err: any) {
+      console.error(
+        'Server error resetting password:',
+        err
+      );
+
+      res.status(500).json({
+        error:
+          err.message ||
+          'Internal error sending reset email',
+      });
+    }
+  }
+);
+
+// -----------------------------------------------------------------------------
+// Registration
+// -----------------------------------------------------------------------------
+
+app.post(
+  '/api/auth/register',
+  async (req: Request, res: Response) => {
+    const {
+      email,
+      password,
+      name,
+      department,
+    } = req.body;
+
+    if (!email) {
+      return res.status(400).json({
+        error: 'Email is required',
+      });
+    }
+
+    const cleanEmail =
+      email.trim().toLowerCase();
+
+    const isAdmin =
+      cleanEmail ===
+      'shadowcyfrin007@gmail.com';
+
+    const role: Role =
+      isAdmin
+        ? 'ADMIN'
+        : 'EMPLOYEE';
+
+    const existing = users.find(
       (u) =>
-        u.id === fbData.localId ||
-        (u.email && u.email.toLowerCase() === cleanIdent)
+        u.email.toLowerCase() ===
+        cleanEmail
     );
 
-    const isAdmin = cleanIdent === 'shadowcyfrin007@gmail.com' || cleanIdent === 'admin@apexcorp.internal';
-
-    if (!foundUser) {
-      foundUser = {
-        id: fbData.localId,
-        email: cleanIdent,
-        name: fbData.displayName || cleanIdent.split('@')[0],
-        role: isAdmin ? 'ADMIN' : 'EMPLOYEE',
-        department: isAdmin ? 'Executive Operations' : 'Engineering',
-        jobTitle: isAdmin ? 'Director of Operations' : 'Senior Specialist',
-        employeeCode: isAdmin ? 'EMP-NNWDC' : `EMP-${fbData.localId.slice(0, 5).toUpperCase()}`,
-        avatarUrl: `https://api.dicebear.com/7.x/bottts/svg?seed=${fbData.localId}`,
-        joinedDate: systemTodayDate,
-      };
+    if (existing) {
+      return res.json({
+        success: true,
+        user: existing,
+      });
     }
 
-    const savedUser = upsertUser(foundUser);
-    return res.json({
+    const newUser: User = {
+      id:
+        isAdmin &&
+        cleanEmail ===
+          'shadowcyfrin007@gmail.com'
+          ? 'admin_shadowcyfrin007'
+          : `usr_${Date.now()}`,
+
+      email: cleanEmail,
+
+      name:
+        name ||
+        (
+          isAdmin
+            ? 'Administrator'
+            : cleanEmail.split('@')[0]
+        ),
+
+      role,
+
+      department:
+        department ||
+        (
+          isAdmin
+            ? 'Executive Operations'
+            : 'General'
+        ),
+
+      jobTitle:
+        isAdmin
+          ? 'System Administrator'
+          : 'Team Member',
+
+      employeeCode:
+        isAdmin
+          ? `ADM-${Math.floor(
+              100 + Math.random() * 900
+            )}`
+          : `EMP-${Math.floor(
+              1000 + Math.random() * 9000
+            )}`,
+
+      avatarUrl:
+        `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(
+          cleanEmail
+        )}`,
+
+      joinedDate:
+        systemTodayDate,
+    };
+
+    // Save profile to Firestore.
+    const savedUser =
+      await upsertUser(newUser);
+
+    // Create Firebase Auth account.
+    try {
+      await fetch(
+        `https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${firebaseApiKey}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            email: cleanEmail,
+            password:
+              password ||
+              'ApexPass#2026',
+            returnSecureToken: true,
+          }),
+        }
+      );
+    } catch (e) {
+      console.warn(
+        '[Firebase Auth] Registration request failed:',
+        e
+      );
+    }
+
+    res.json({
       success: true,
       user: savedUser,
-      token: fbData.idToken,
-    });
-  } catch (e: any) {
-    console.error('Server login proxy error:', e);
-    return res.status(500).json({
-      error: 'Authentication service temporarily unavailable. Please try again later.',
     });
   }
-});
+);
 
-// Sync or upsert authenticated user from Firebase Auth into server store
-app.post('/api/auth/sync-user', (req: Request, res: Response) => {
-  const { user } = req.body;
-  if (!user || !user.id) {
-    return res.status(400).json({ error: 'Valid user object required' });
-  }
+// -----------------------------------------------------------------------------
+// Login
+// -----------------------------------------------------------------------------
 
-  const savedUser = upsertUser(user);
-  res.json({ success: true, user: savedUser });
-});
+app.post(
+  '/api/auth/login',
+  async (req: Request, res: Response) => {
+    const {
+      identifier,
+      password,
+    } = req.body;
 
-// Bulk sync users from Firestore into server store
-app.post('/api/admin/sync-all-users', (req: Request, res: Response) => {
-  const { users: incomingUsers } = req.body;
-  if (Array.isArray(incomingUsers)) {
-    for (const inUser of incomingUsers) {
-      if (inUser && (inUser.id || inUser.email)) {
-        upsertUser(inUser);
+    if (!identifier || !password) {
+      return res.status(400).json({
+        error:
+          'Corporate email and password are required',
+      });
+    }
+
+    const cleanIdent =
+      identifier
+        .trim()
+        .toLowerCase();
+
+    try {
+      const fbRes = await fetch(
+        `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${firebaseApiKey}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            email: cleanIdent,
+            password,
+            returnSecureToken: true,
+          }),
+        }
+      );
+
+      const fbData: any =
+        await fbRes.json();
+
+      if (
+        !fbRes.ok ||
+        !fbData.localId
+      ) {
+        const errMsg =
+          fbData?.error?.message;
+
+        if (
+          errMsg ===
+          'EMAIL_NOT_FOUND'
+        ) {
+          return res.status(401).json({
+            error:
+              'No account found with this corporate email. Please register or check your email.',
+          });
+        }
+
+        if (
+          errMsg ===
+            'INVALID_PASSWORD' ||
+          errMsg ===
+            'INVALID_LOGIN_CREDENTIALS'
+        ) {
+          return res.status(401).json({
+            error:
+              'Invalid password. Please check your credentials or reset your password.',
+          });
+        }
+
+        if (
+          errMsg ===
+          'USER_DISABLED'
+        ) {
+          return res.status(403).json({
+            error:
+              'This corporate account has been disabled.',
+          });
+        }
+
+        return res.status(401).json({
+          error:
+            'Invalid corporate email or password. Access denied.',
+        });
       }
+
+      let foundUser =
+        users.find(
+          (u) =>
+            u.id ===
+              fbData.localId ||
+            (
+              u.email &&
+              u.email.toLowerCase() ===
+                cleanIdent
+            )
+        );
+
+      const isAdmin =
+        cleanIdent ===
+          'shadowcyfrin007@gmail.com' ||
+        cleanIdent ===
+          'admin@apexcorp.internal';
+
+      if (!foundUser) {
+        foundUser = {
+          id: fbData.localId,
+
+          email: cleanIdent,
+
+          name:
+            fbData.displayName ||
+            cleanIdent.split('@')[0],
+
+          role:
+            isAdmin
+              ? 'ADMIN'
+              : 'EMPLOYEE',
+
+          department:
+            isAdmin
+              ? 'Executive Operations'
+              : 'Engineering',
+
+          jobTitle:
+            isAdmin
+              ? 'Director of Operations'
+              : 'Senior Specialist',
+
+          employeeCode:
+            isAdmin
+              ? 'EMP-NNWDC'
+              : `EMP-${fbData.localId
+                  .slice(0, 5)
+                  .toUpperCase()}`,
+
+          avatarUrl:
+            `https://api.dicebear.com/7.x/bottts/svg?seed=${fbData.localId}`,
+
+          joinedDate:
+            systemTodayDate,
+        };
+      }
+
+      const savedUser =
+        await upsertUser(foundUser);
+
+      return res.json({
+        success: true,
+        user: savedUser,
+        token: fbData.idToken,
+      });
+    } catch (e: any) {
+      console.error(
+        'Server login proxy error:',
+        e
+      );
+
+      return res.status(500).json({
+        error:
+          'Authentication service temporarily unavailable. Please try again later.',
+      });
     }
   }
-  users = deduplicateUsers(users);
-  res.json({ success: true, count: users.length });
-});
+);
 
-// Admin can register an employee record
-app.post('/api/admin/employees', (req: Request, res: Response) => {
-  const role = req.headers['x-user-role'] as string;
-  if (role !== 'ADMIN') {
-    return res.status(403).json({ error: 'Forbidden: Admin access required' });
+// -----------------------------------------------------------------------------
+// Sync User
+// -----------------------------------------------------------------------------
+
+app.post(
+  '/api/auth/sync-user',
+  async (req: Request, res: Response) => {
+    const { user } = req.body;
+
+    if (!user || !user.id) {
+      return res.status(400).json({
+        error: 'Valid user object required',
+      });
+    }
+
+    const savedUser =
+      await upsertUser(user);
+
+    res.json({
+      success: true,
+      user: savedUser,
+    });
   }
+);
 
-  const { name, email, department, jobTitle, role: empRole } = req.body;
-  if (!name || !email) {
-    return res.status(400).json({ error: 'Name and email are required' });
-  }
+// -----------------------------------------------------------------------------
+// Bulk Sync Users
+// -----------------------------------------------------------------------------
 
-  const newEmp: User = {
-    id: `usr_${Date.now()}`,
-    email: email.trim().toLowerCase(),
-    name: name.trim(),
-    role: empRole === 'ADMIN' ? 'ADMIN' : 'EMPLOYEE',
-    department: department || 'Engineering',
-    jobTitle: jobTitle || 'Staff Specialist',
-    employeeCode: `EMP-${Math.floor(1000 + Math.random() * 9000)}`,
-    avatarUrl: `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(name)}`,
-    joinedDate: systemTodayDate,
-  };
+app.post(
+  '/api/admin/sync-all-users',
+  async (req: Request, res: Response) => {
+    const {
+      users: incomingUsers,
+    } = req.body;
 
-  const savedEmp = upsertUser(newEmp);
-  res.json({ success: true, user: savedEmp });
-});
-
-// Get current day status & active record for user
-app.get('/api/attendance/today', (req: Request, res: Response) => {
-  const userId = req.query.userId as string;
-  if (!userId) {
-    return res.status(400).json({ error: 'userId is required' });
-  }
-
-  const todayRecord = findRecordForUser(userId, systemTodayDate);
-  if (todayRecord && todayRecord.checkInTime && todayRecord.checkOutTime) {
-    const inMs = new Date(todayRecord.checkInTime).getTime();
-    const outMs = new Date(todayRecord.checkOutTime).getTime();
-    if (!isNaN(inMs) && !isNaN(outMs) && outMs >= inMs) {
-      const realDur = (outMs - inMs) / (1000 * 60 * 60);
-      if (todayRecord.hoursWorked === 8.25 && realDur < 0.1) {
-        todayRecord.hoursWorked = Math.round(realDur * 1000) / 1000;
+    if (Array.isArray(incomingUsers)) {
+      for (const inUser of incomingUsers) {
+        if (
+          inUser &&
+          (inUser.id || inUser.email)
+        ) {
+          await upsertUser(inUser);
+        }
       }
     }
-  }
-  res.json({
-    todayDate: systemTodayDate,
-    record: todayRecord || null,
-  });
-});
 
-// Clock In: STRICT ACTIVE DAY RESTRICTION ENFORCED
-app.post('/api/attendance/check-in', (req: Request, res: Response) => {
-  const { userId, date } = req.body;
-  if (!userId) {
-    return res.status(400).json({ error: 'userId is required' });
-  }
+    users = deduplicateUsers(users);
 
-  const targetDate = date || systemTodayDate;
-
-  // Pre-Launch Restriction: Website operations officially commence on September 4, 2026
-  if (targetDate < SYSTEM_LAUNCH_DATE) {
-    return res.status(403).json({
-      error: 'Pre-Launch Period: Website and attendance operations officially start on September 4, 2026 (IST).',
+    res.json({
+      success: true,
+      count: users.length,
     });
   }
+);
 
-  // Rule 1: An employee can ONLY click "Check In" on the exact current day
-  if (targetDate !== systemTodayDate) {
-    return res.status(403).json({
-      error: 'Active Day Restriction: Checking in for past or future dates is strictly disabled.',
-    });
-  }
+// -----------------------------------------------------------------------------
+// Admin Create Employee
+// -----------------------------------------------------------------------------
 
-  // Check if already checked in today
-  const existingRecord = findRecordForUser(userId, targetDate);
-  if (existingRecord && existingRecord.checkInTime && !existingRecord.checkOutTime) {
-    return res.status(400).json({ error: 'Already checked in for today.' });
-  }
+app.post(
+  '/api/admin/employees',
+  async (req: Request, res: Response) => {
+    const role =
+      req.headers['x-user-role'] as string;
 
-  const now = new Date();
-  const dateObj = new Date(targetDate);
-  const isSunday = dateObj.getDay() === 0;
+    if (role !== 'ADMIN') {
+      return res.status(403).json({
+        error:
+          'Forbidden: Admin access required',
+      });
+    }
 
-  const newRecord: AttendanceRecord = {
-    id: `rec_${userId}_${targetDate}_${Date.now()}`,
-    userId,
-    date: targetDate,
-    checkInTime: now.toISOString(),
-    checkOutTime: null,
-    status: 'CHECKED_IN',
-    hoursWorked: null,
-    createdAt: now.toISOString(),
-    updatedAt: now.toISOString(),
-  };
+    const {
+      name,
+      email,
+      department,
+      jobTitle,
+      role: empRole,
+    } = req.body;
 
-  const existingRecordIndex = records.findIndex((r) => r.userId === userId && r.date === targetDate);
-  if (existingRecordIndex !== -1) {
-    records[existingRecordIndex] = newRecord;
-  } else {
-    records.push(newRecord);
-  }
+    if (!name || !email) {
+      return res.status(400).json({
+        error:
+          'Name and email are required',
+      });
+    }
 
-  res.json({
-    success: true,
-    message: isSunday
-      ? 'Checked in successfully on Sunday shift! Complete checkout to earn +1 Paid Holiday Credit.'
-      : 'Checked in successfully for today.',
-    record: newRecord,
-  });
-});
+    const newEmp: User = {
+      id: `usr_${Date.now()}`,
 
-// Clock Out: STRICT ACTIVE DAY RESTRICTION ENFORCED WITH RESILIENT STATE RESTORATION
-app.post('/api/attendance/check-out', (req: Request, res: Response) => {
-  const { userId, date, checkInTime: clientCheckInTime } = req.body;
-  if (!userId) {
-    return res.status(400).json({ error: 'userId is required' });
-  }
+      email:
+        email
+          .trim()
+          .toLowerCase(),
 
-  const targetDate = date || systemTodayDate;
+      name:
+        name.trim(),
 
-  // Rule 1: An employee can ONLY click "Check Out" on the exact current day
-  if (targetDate !== systemTodayDate) {
-    return res.status(403).json({
-      error: 'Active Day Restriction: Checking out for past or future dates is strictly disabled.',
-    });
-  }
+      role:
+        empRole === 'ADMIN'
+          ? 'ADMIN'
+          : 'EMPLOYEE',
 
-  let existingRecord = findRecordForUser(userId, targetDate);
+      department:
+        department ||
+        'Engineering',
 
-  // If server restarted or memory was cleared but client has checkInTime from Firestore or local state:
-  if ((!existingRecord || !existingRecord.checkInTime) && clientCheckInTime) {
-    existingRecord = {
-      id: `rec_${userId}_${targetDate}_${Date.now()}`,
-      userId,
-      date: targetDate,
-      checkInTime: clientCheckInTime,
-      checkOutTime: null,
-      status: 'CHECKED_IN',
-      hoursWorked: null,
-      createdAt: clientCheckInTime,
-      updatedAt: new Date().toISOString(),
+      jobTitle:
+        jobTitle ||
+        'Staff Specialist',
+
+      employeeCode:
+        `EMP-${Math.floor(
+          1000 +
+            Math.random() *
+              9000
+        )}`,
+
+      avatarUrl:
+        `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(
+          name
+        )}`,
+
+      joinedDate:
+        systemTodayDate,
     };
-    records.push(existingRecord);
-  }
 
-  // Graceful fallback for testing: If checking out today but no prior check-in registered,
-  // register a default check-in from 1 hour ago so checkout completes cleanly
-  if (!existingRecord || !existingRecord.checkInTime) {
-    const fallbackIn = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-    existingRecord = {
-      id: `rec_${userId}_${targetDate}_${Date.now()}`,
+    const savedEmp =
+      await upsertUser(newEmp);
+
+    res.json({
+      success: true,
+      user: savedEmp,
+    });
+  }
+);
+
+// -----------------------------------------------------------------------------
+// Today's Attendance
+// -----------------------------------------------------------------------------
+
+app.get(
+  '/api/attendance/today',
+  (req: Request, res: Response) => {
+    const userId =
+      req.query.userId as string;
+
+    if (!userId) {
+      return res.status(400).json({
+        error: 'userId is required',
+      });
+    }
+
+    const todayRecord =
+      findRecordForUser(
+        userId,
+        systemTodayDate
+      );
+
+    if (
+      todayRecord &&
+      todayRecord.checkInTime &&
+      todayRecord.checkOutTime
+    ) {
+      const inMs =
+        new Date(
+          todayRecord.checkInTime
+        ).getTime();
+
+      const outMs =
+        new Date(
+          todayRecord.checkOutTime
+        ).getTime();
+
+      if (
+        !isNaN(inMs) &&
+        !isNaN(outMs) &&
+        outMs >= inMs
+      ) {
+        const realDur =
+          (outMs - inMs) /
+          (1000 * 60 * 60);
+
+        if (
+          todayRecord.hoursWorked ===
+            8.25 &&
+          realDur < 0.1
+        ) {
+          todayRecord.hoursWorked =
+            Math.round(
+              realDur * 1000
+            ) / 1000;
+        }
+      }
+    }
+
+    res.json({
+      todayDate:
+        systemTodayDate,
+      record:
+        todayRecord || null,
+    });
+  }
+);
+
+// -----------------------------------------------------------------------------
+// Check In
+// -----------------------------------------------------------------------------
+
+app.post(
+  '/api/attendance/check-in',
+  async (req: Request, res: Response) => {
+    const {
       userId,
-      date: targetDate,
-      checkInTime: fallbackIn,
-      checkOutTime: null,
-      status: 'CHECKED_IN',
-      hoursWorked: 1,
-      createdAt: fallbackIn,
-      updatedAt: new Date().toISOString(),
-    };
-    records.push(existingRecord);
-  }
+      date,
+    } = req.body;
 
-  if (existingRecord.checkOutTime) {
-    return res.status(400).json({ error: 'Already checked out for today.' });
-  }
+    if (!userId) {
+      return res.status(400).json({
+        error: 'userId is required',
+      });
+    }
 
-  const now = new Date();
-  const checkIn = new Date(existingRecord.checkInTime);
-  const diffMs = Math.max(0, now.getTime() - checkIn.getTime());
-  const durationHours = Math.round((diffMs / (1000 * 60 * 60)) * 1000) / 1000;
+    const targetDate =
+      date || systemTodayDate;
 
-  const dateObj = new Date(targetDate);
-  const isSunday = dateObj.getDay() === 0;
+    if (
+      targetDate <
+      SYSTEM_LAUNCH_DATE
+    ) {
+      return res.status(403).json({
+        error:
+          'Pre-Launch Period: Website and attendance operations officially start on September 4, 2026 (IST).',
+      });
+    }
 
-  existingRecord.checkOutTime = now.toISOString();
-  existingRecord.hoursWorked = durationHours > 0 ? durationHours : 0.05;
-  existingRecord.status = isSunday ? 'SUNDAY_WORKED' : 'PRESENT';
-  existingRecord.updatedAt = now.toISOString();
+    if (
+      targetDate !==
+      systemTodayDate
+    ) {
+      return res.status(403).json({
+        error:
+          'Active Day Restriction: Checking in for past or future dates is strictly disabled.',
+      });
+    }
 
-  res.json({
-    success: true,
-    message: isSunday
-      ? 'Sunday shift checked out! +1 Paid Holiday Compensation Credit added to your balance.'
-      : 'Checked out successfully. Shift completed.',
-    record: existingRecord,
-    sundayCreditEarned: isSunday,
-  });
-});
+    const existingRecord =
+      findRecordForUser(
+        userId,
+        targetDate
+      );
 
-// Single User Shift Reset Endpoint (for test iterations)
-app.post('/api/attendance/reset', (req: Request, res: Response) => {
-  const { userId, date } = req.body;
-  const targetDate = date || systemTodayDate;
-  if (userId) {
-    const cleanId = userId.trim().toLowerCase();
-    const targetUser = users.find(
-      (u) =>
-        u.id.toLowerCase() === cleanId ||
-        u.email.toLowerCase() === cleanId ||
-        (u.employeeCode && u.employeeCode.toLowerCase() === cleanId)
+    if (
+      existingRecord &&
+      existingRecord.checkInTime &&
+      !existingRecord.checkOutTime
+    ) {
+      return res.status(400).json({
+        error:
+          'Already checked in for today.',
+      });
+    }
+
+    function isSundayIST(
+      dateString: string
+    ): boolean {
+      const [
+        year,
+        month,
+        day,
+      ] =
+        dateString
+          .split('-')
+          .map(Number);
+
+      const date = new Date(
+        year,
+        month - 1,
+        day
+      );
+
+      return (
+        date.getDay() === 0
+      );
+    }
+
+    const now =
+      new Date();
+
+    const isSunday =
+      isSundayIST(
+        targetDate
+      );
+
+    const newRecord: AttendanceRecord =
+      {
+        id: `rec_${userId}_${targetDate}_${Date.now()}`,
+
+        userId,
+
+        date:
+          targetDate,
+
+        checkInTime:
+          now.toISOString(),
+
+        checkOutTime:
+          null,
+
+        status:
+          'CHECKED_IN',
+
+        hoursWorked:
+          null,
+
+        createdAt:
+          now.toISOString(),
+
+        updatedAt:
+          now.toISOString(),
+      };
+
+    // Replace existing local record if one exists.
+    const existingRecordIndex =
+      records.findIndex(
+        (r) =>
+          r.userId ===
+            userId &&
+          r.date ===
+            targetDate
+      );
+
+    if (
+      existingRecordIndex !==
+      -1
+    ) {
+      // Delete old Firestore document.
+      await deleteAttendanceRecord(
+        records[
+          existingRecordIndex
+        ].id
+      );
+
+      records[
+        existingRecordIndex
+      ] = newRecord;
+    } else {
+      records.push(
+        newRecord
+      );
+    }
+
+    // Persist to Firestore.
+    await saveAttendanceRecord(
+      newRecord
     );
-    const matchingIds = new Set<string>([cleanId]);
-    if (targetUser) {
-      matchingIds.add(targetUser.id.toLowerCase());
-      matchingIds.add(targetUser.email.toLowerCase());
-      if (targetUser.employeeCode) matchingIds.add(targetUser.employeeCode.toLowerCase());
-      users
-        .filter((u) => u.email.toLowerCase() === targetUser.email.toLowerCase())
-        .forEach((u) => {
-          matchingIds.add(u.id.toLowerCase());
-          if (u.employeeCode) matchingIds.add(u.employeeCode.toLowerCase());
+
+    res.json({
+      success: true,
+
+      message: isSunday
+        ? 'Checked in successfully on Sunday shift! Complete checkout to earn +1 Paid Holiday Credit.'
+        : 'Checked in successfully for today.',
+
+      record:
+        newRecord,
+    });
+  }
+);
+
+// -----------------------------------------------------------------------------
+// Check Out
+// -----------------------------------------------------------------------------
+
+app.post(
+  '/api/attendance/check-out',
+  async (req: Request, res: Response) => {
+    const {
+      userId,
+      date,
+      checkInTime:
+        clientCheckInTime,
+    } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({
+        error: 'userId is required',
+      });
+    }
+
+    const targetDate =
+      date || systemTodayDate;
+
+    if (
+      targetDate !==
+      systemTodayDate
+    ) {
+      return res.status(403).json({
+        error:
+          'Active Day Restriction: Checking out for past or future dates is strictly disabled.',
+      });
+    }
+
+    let existingRecord =
+      findRecordForUser(
+        userId,
+        targetDate
+      );
+
+    // Restore from client-provided check-in.
+    if (
+      (!existingRecord ||
+        !existingRecord.checkInTime) &&
+      clientCheckInTime
+    ) {
+      existingRecord = {
+        id: `rec_${userId}_${targetDate}_${Date.now()}`,
+
+        userId,
+
+        date:
+          targetDate,
+
+        checkInTime:
+          clientCheckInTime,
+
+        checkOutTime:
+          null,
+
+        status:
+          'CHECKED_IN',
+
+        hoursWorked:
+          null,
+
+        createdAt:
+          clientCheckInTime,
+
+        updatedAt:
+          new Date().toISOString(),
+      };
+
+      records.push(
+        existingRecord
+      );
+
+      await saveAttendanceRecord(
+        existingRecord
+      );
+    }
+
+    // Fallback for testing.
+    if (
+      !existingRecord ||
+      !existingRecord.checkInTime
+    ) {
+      const fallbackIn =
+        new Date(
+          Date.now() -
+            60 * 60 * 1000
+        ).toISOString();
+
+      existingRecord = {
+        id: `rec_${userId}_${targetDate}_${Date.now()}`,
+
+        userId,
+
+        date:
+          targetDate,
+
+        checkInTime:
+          fallbackIn,
+
+        checkOutTime:
+          null,
+
+        status:
+          'CHECKED_IN',
+
+        hoursWorked:
+          1,
+
+        createdAt:
+          fallbackIn,
+
+        updatedAt:
+          new Date().toISOString(),
+      };
+
+      records.push(
+        existingRecord
+      );
+
+      await saveAttendanceRecord(
+        existingRecord
+      );
+    }
+
+    if (
+      existingRecord.checkOutTime
+    ) {
+      return res.status(400).json({
+        error:
+          'Already checked out for today.',
+      });
+    }
+
+    const now =
+      new Date();
+
+    const checkIn =
+      new Date(
+        existingRecord.checkInTime
+      );
+
+    const diffMs =
+      Math.max(
+        0,
+        now.getTime() -
+          checkIn.getTime()
+      );
+
+    const durationHours =
+      Math.round(
+        (
+          diffMs /
+          (1000 * 60 * 60)
+        ) * 1000
+      ) / 1000;
+
+    const dateObj =
+      new Date(
+        targetDate
+      );
+
+    const isSunday =
+      dateObj.getDay() === 0;
+
+    existingRecord.checkOutTime =
+      now.toISOString();
+
+    existingRecord.hoursWorked =
+      durationHours > 0
+        ? durationHours
+        : 0.05;
+
+    existingRecord.status =
+      isSunday
+        ? 'SUNDAY_WORKED'
+        : 'PRESENT';
+
+    existingRecord.updatedAt =
+      now.toISOString();
+
+    // Persist updated record.
+    await saveAttendanceRecord(
+      existingRecord
+    );
+
+    res.json({
+      success: true,
+
+      message: isSunday
+        ? 'Sunday shift checked out! +1 Paid Holiday Compensation Credit added to your balance.'
+        : 'Checked out successfully. Shift completed.',
+
+      record:
+        existingRecord,
+
+      sundayCreditEarned:
+        isSunday,
+    });
+  }
+);
+
+// -----------------------------------------------------------------------------
+// Single User Shift Reset
+// -----------------------------------------------------------------------------
+
+app.post(
+  '/api/attendance/reset',
+  async (req: Request, res: Response) => {
+    const {
+      userId,
+      date,
+    } = req.body;
+
+    const targetDate =
+      date || systemTodayDate;
+
+    if (userId) {
+      const cleanId =
+        userId
+          .trim()
+          .toLowerCase();
+
+      const targetUser =
+        users.find(
+          (u) =>
+            u.id.toLowerCase() ===
+              cleanId ||
+            u.email.toLowerCase() ===
+              cleanId ||
+            (
+              u.employeeCode &&
+              u.employeeCode.toLowerCase() ===
+                cleanId
+            )
+        );
+
+      const matchingIds =
+        new Set<string>([
+          cleanId,
+        ]);
+
+      if (targetUser) {
+        matchingIds.add(
+          targetUser.id.toLowerCase()
+        );
+
+        matchingIds.add(
+          targetUser.email.toLowerCase()
+        );
+
+        if (
+          targetUser.employeeCode
+        ) {
+          matchingIds.add(
+            targetUser.employeeCode.toLowerCase()
+          );
+        }
+
+        users
+          .filter(
+            (u) =>
+              u.email.toLowerCase() ===
+              targetUser.email.toLowerCase()
+          )
+          .forEach((u) => {
+            matchingIds.add(
+              u.id.toLowerCase()
+            );
+
+            if (
+              u.employeeCode
+            ) {
+              matchingIds.add(
+                u.employeeCode.toLowerCase()
+              );
+            }
+          });
+      }
+
+      // Delete from Firestore.
+      await deleteMatchingAttendanceRecords(
+        (r) =>
+          matchingIds.has(
+            (
+              r.userId ||
+              ''
+            ).toLowerCase()
+          ) &&
+          r.date ===
+            targetDate
+      );
+
+      // Delete from local cache.
+      records =
+        records.filter(
+          (r) =>
+            !(
+              matchingIds.has(
+                (
+                  r.userId ||
+                  ''
+                ).toLowerCase()
+              ) &&
+              r.date ===
+                targetDate
+            )
+        );
+    } else {
+      // Delete all records for target date from Firestore.
+      await deleteMatchingAttendanceRecords(
+        (r) =>
+          r.date ===
+          targetDate
+      );
+
+      // Delete from local cache.
+      records =
+        records.filter(
+          (r) =>
+            r.date !==
+            targetDate
+        );
+    }
+
+    res.json({
+      success: true,
+
+      message:
+        'Attendance shift session reset to Not Clocked In.',
+    });
+  }
+);
+
+// -----------------------------------------------------------------------------
+// Admin Reset Attendance
+// -----------------------------------------------------------------------------
+
+app.post(
+  '/api/admin/reset-attendance',
+  async (req: Request, res: Response) => {
+    const targetDate =
+      req.body.date ||
+      systemTodayDate;
+
+    if (req.body.all) {
+      await deleteAllAttendance();
+
+      records = [];
+    } else {
+      await deleteMatchingAttendanceRecords(
+        (r) =>
+          r.date ===
+          targetDate
+      );
+
+      records =
+        records.filter(
+          (r) =>
+            r.date !==
+            targetDate
+        );
+    }
+
+    res.json({
+      success: true,
+
+      message: `Attendance records for ${targetDate} have been completely reset for all users.`,
+
+      remainingRecordsCount:
+        records.length,
+    });
+  }
+);
+
+// -----------------------------------------------------------------------------
+// Admin Shift Simulation
+// -----------------------------------------------------------------------------
+
+app.post(
+  '/api/admin/simulate-shift',
+  async (req: Request, res: Response) => {
+    const {
+      userId,
+      date,
+      hours = 8.5,
+      isSundayShift = false,
+    } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({
+        error: 'userId is required',
+      });
+    }
+
+    const targetDate =
+      date || systemTodayDate;
+
+    const checkInDate =
+      new Date(
+        `${targetDate}T09:00:00.000Z`
+      );
+
+    const checkOutDate =
+      new Date(
+        checkInDate.getTime() +
+          hours *
+            60 *
+            60 *
+            1000
+      );
+
+    const simulatedRecord:
+      AttendanceRecord =
+      {
+        id: `rec_${userId}_${targetDate}_${Date.now()}`,
+
+        userId,
+
+        date:
+          targetDate,
+
+        checkInTime:
+          checkInDate.toISOString(),
+
+        checkOutTime:
+          checkOutDate.toISOString(),
+
+        hoursWorked:
+          hours,
+
+        status:
+          isSundayShift
+            ? 'SUNDAY_WORKED'
+            : 'PRESENT',
+
+        createdAt:
+          checkInDate.toISOString(),
+
+        updatedAt:
+          checkOutDate.toISOString(),
+      };
+
+    const existingIdx =
+      records.findIndex(
+        (r) =>
+          r.userId ===
+            userId &&
+          r.date ===
+            targetDate
+      );
+
+    if (
+      existingIdx !==
+      -1
+    ) {
+      // Remove old Firestore record.
+      await deleteAttendanceRecord(
+        records[
+          existingIdx
+        ].id
+      );
+
+      records[
+        existingIdx
+      ] = simulatedRecord;
+    } else {
+      records.push(
+        simulatedRecord
+      );
+    }
+
+    // Persist simulated record.
+    await saveAttendanceRecord(
+      simulatedRecord
+    );
+
+    res.json({
+      success: true,
+
+      message: `Simulated ${hours}h ${
+        isSundayShift
+          ? 'Sunday (+1 Credit)'
+          : 'standard'
+      } shift created for ${targetDate}.`,
+
+      record:
+        simulatedRecord,
+    });
+  }
+);
+
+// -----------------------------------------------------------------------------
+// Monthly Attendance Evaluation
+// -----------------------------------------------------------------------------
+
+app.get(
+  '/api/attendance/month/:userId/:year/:month',
+  async (
+    req: Request,
+    res: Response
+  ) => {
+    const {
+      userId,
+      year,
+      month,
+    } = req.params;
+
+    let user =
+      users.find(
+        (u) =>
+          u.id ===
+            userId ||
+          (
+            req.query.email &&
+            u.email &&
+            u.email.toLowerCase() ===
+              (
+                req.query.email as string
+              ).toLowerCase()
+          )
+      );
+
+    if (!user) {
+      user =
+        await upsertUser({
+          id: userId,
+
+          email:
+            (
+              req.query.email as string
+            ) ||
+            'employee@apexcorp.internal',
+
+          name:
+            (
+              req.query.name as string
+            ) ||
+            'Team Member',
+
+          role:
+            (
+              req.query.role as any
+            ) ||
+            'EMPLOYEE',
+
+          department:
+            (
+              req.query.department as string
+            ) ||
+            'Engineering',
+
+          jobTitle:
+            'Corporate Staff',
+
+          employeeCode:
+            `EMP-${userId
+              .slice(0, 5)
+              .toUpperCase()}`,
+
+          joinedDate:
+            systemTodayDate,
         });
     }
-    records = records.filter(
-      (r) => !(matchingIds.has((r.userId || '').toLowerCase()) && r.date === targetDate)
-    );
-  } else {
-    records = records.filter((r) => r.date !== targetDate);
-  }
-  res.json({
-    success: true,
-    message: 'Attendance shift session reset to Not Clocked In.',
-  });
-});
 
-// Admin Reset Endpoint: Resets attendance for all users on today (or all dates)
-app.post('/api/admin/reset-attendance', (req: Request, res: Response) => {
-  const targetDate = req.body.date || systemTodayDate;
-  if (req.body.all) {
-    records = [];
-  } else {
-    records = records.filter((r) => r.date !== targetDate);
-  }
-  res.json({
-    success: true,
-    message: `Attendance records for ${targetDate} have been completely reset for all users.`,
-    remainingRecordsCount: records.length,
-  });
-});
+    const y =
+      parseInt(
+        year,
+        10
+      );
 
-// Admin Shift Simulation Endpoint (for testing and demonstrating calculations in inspection panel)
-app.post('/api/admin/simulate-shift', (req: Request, res: Response) => {
-  const { userId, date, hours = 8.5, isSundayShift = false } = req.body;
-  if (!userId) {
-    return res.status(400).json({ error: 'userId is required' });
-  }
+    const m =
+      parseInt(
+        month,
+        10
+      );
 
-  const targetDate = date || systemTodayDate;
-  const checkInDate = new Date(`${targetDate}T09:00:00.000Z`);
-  const checkOutDate = new Date(checkInDate.getTime() + hours * 60 * 60 * 1000);
+    const recordsMap =
+      getEmployeeRecordsMap(
+        userId
+      );
 
-  const simulatedRecord: AttendanceRecord = {
-    id: `rec_${userId}_${targetDate}_${Date.now()}`,
-    userId,
-    date: targetDate,
-    checkInTime: checkInDate.toISOString(),
-    checkOutTime: checkOutDate.toISOString(),
-    hoursWorked: hours,
-    status: isSundayShift ? 'SUNDAY_WORKED' : 'PRESENT',
-    createdAt: checkInDate.toISOString(),
-    updatedAt: checkOutDate.toISOString(),
-  };
+    const evaluation =
+      evaluateMonthlyAttendance(
+        userId,
+        y,
+        m,
+        recordsMap,
+        systemTodayDate
+      );
 
-  const existingIdx = records.findIndex(
-    (r) => r.userId === userId && r.date === targetDate
-  );
-  if (existingIdx !== -1) {
-    records[existingIdx] = simulatedRecord;
-  } else {
-    records.push(simulatedRecord);
-  }
+    res.json({
+      user,
 
-  res.json({
-    success: true,
-    message: `Simulated ${hours}h ${isSundayShift ? 'Sunday (+1 Credit)' : 'standard'} shift created for ${targetDate}.`,
-    record: simulatedRecord,
-  });
-});
+      year:
+        y,
 
-// Month Attendance Evaluation for a user
-app.get('/api/attendance/month/:userId/:year/:month', (req: Request, res: Response) => {
-  const { userId, year, month } = req.params;
-  let user = users.find(
-    (u) =>
-      u.id === userId ||
-      (req.query.email && u.email && u.email.toLowerCase() === (req.query.email as string).toLowerCase())
-  );
-  if (!user) {
-    // Dynamic fallback for freshly authenticated Firebase users
-    user = upsertUser({
-      id: userId,
-      email: (req.query.email as string) || 'employee@apexcorp.internal',
-      name: (req.query.name as string) || 'Team Member',
-      role: (req.query.role as any) || 'EMPLOYEE',
-      department: (req.query.department as string) || 'Engineering',
-      jobTitle: 'Corporate Staff',
-      employeeCode: `EMP-${userId.slice(0, 5).toUpperCase()}`,
-      joinedDate: systemTodayDate,
+      month:
+        m,
+
+      todayDate:
+        systemTodayDate,
+
+      evaluation,
     });
   }
+);
 
-  const y = parseInt(year, 10);
-  const m = parseInt(month, 10);
-  const recordsMap = getEmployeeRecordsMap(userId);
+// -----------------------------------------------------------------------------
+// Admin Employee Overview
+// -----------------------------------------------------------------------------
 
-  const evaluation = evaluateMonthlyAttendance(userId, y, m, recordsMap, systemTodayDate);
+app.get(
+  '/api/admin/employees',
+  (req: Request, res: Response) => {
+    const role =
+      req.headers[
+        'x-user-role'
+      ] as string;
 
-  res.json({
-    user,
-    year: y,
-    month: m,
-    todayDate: systemTodayDate,
-    evaluation,
-  });
-});
-
-// Admin Route: Get Master Attendance Overview
-// Rule: Protect /admin strictly to ADMIN users
-app.get('/api/admin/employees', (req: Request, res: Response) => {
-  const role = req.headers['x-user-role'] as string;
-  if (role !== 'ADMIN') {
-    return res.status(403).json({
-      error: '403 Forbidden: Access restricted strictly to users with the ADMIN role.',
-    });
-  }
-
-  const year = 2026;
-  const month = 9;
-
-  // Deduplicate before generating summaries
-  users = deduplicateUsers(users);
-
-  // Include ALL registered employees, staff, and personnel
-  const employeeSummaries = users.map((employee) => {
-    const recordsMap = getEmployeeRecordsMap(employee.id);
-    const evalResult = evaluateMonthlyAttendance(employee.id, year, month, recordsMap, systemTodayDate);
-    const todayRecord = recordsMap.get(systemTodayDate);
-
-    return {
-      user: employee,
-      stats: evalResult.stats,
-      todayRecord: todayRecord || null,
-      todayStatus: todayRecord
-        ? todayRecord.checkOutTime
-          ? 'PRESENT'
-          : todayRecord.checkInTime
-          ? 'CHECKED_IN'
-          : 'NOT_CHECKED_IN'
-        : 'NOT_CHECKED_IN',
-    };
-  });
-
-  res.json({
-    todayDate: systemTodayDate,
-    employees: employeeSummaries,
-  });
-});
-
-// Admin Route: Get Detailed Employee Inspection for Slide-over
-app.get('/api/admin/employee/:id/attendance', (req: Request, res: Response) => {
-  const role = req.headers['x-user-role'] as string;
-  if (role !== 'ADMIN') {
-    return res.status(403).json({
-      error: '403 Forbidden: Access restricted strictly to users with the ADMIN role.',
-    });
-  }
-
-  const { id } = req.params;
-  const cleanId = (id || '').trim().toLowerCase();
-  const employee = users.find(
-    (u) =>
-      u.id.toLowerCase() === cleanId ||
-      u.email.toLowerCase() === cleanId ||
-      (u.employeeCode && u.employeeCode.toLowerCase() === cleanId)
-  );
-
-  if (!employee) {
-    return res.status(404).json({ error: 'Employee not found' });
-  }
-
-  const year = 2026;
-  const month = 9;
-  const recordsMap = getEmployeeRecordsMap(employee.id);
-  const evaluation = evaluateMonthlyAttendance(employee.id, year, month, recordsMap, systemTodayDate);
-
-  res.json({
-    employee,
-    year,
-    month,
-    todayDate: systemTodayDate,
-    evaluation,
-  });
-});
-
-// Simulation Sandbox Helper (allows reviewers to test or toggle mock date)
-app.post('/api/admin/set-system-date', (req: Request, res: Response) => {
-  const { date } = req.body;
-  if (date) {
-    systemTodayDate = date;
-  }
-  res.json({ success: true, systemTodayDate });
-});
-
-// Get Prisma Schema Text Deliverable
-app.get('/api/schema/prisma', (req: Request, res: Response) => {
-  try {
-    const schemaPath = path.join(process.cwd(), 'prisma', 'schema.prisma');
-    if (fs.existsSync(schemaPath)) {
-      const content = fs.readFileSync(schemaPath, 'utf-8');
-      return res.json({ schema: content });
+    if (role !== 'ADMIN') {
+      return res.status(403).json({
+        error:
+          '403 Forbidden: Access restricted strictly to users with the ADMIN role.',
+      });
     }
-    res.status(404).json({ error: 'Prisma schema file not found' });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
+
+    const year =
+      2026;
+
+    const month =
+      9;
+
+    users =
+      deduplicateUsers(
+        users
+      );
+
+    const employeeSummaries =
+      users.map(
+        (employee) => {
+          const recordsMap =
+            getEmployeeRecordsMap(
+              employee.id
+            );
+
+          const evalResult =
+            evaluateMonthlyAttendance(
+              employee.id,
+              year,
+              month,
+              recordsMap,
+              systemTodayDate
+            );
+
+          const todayRecord =
+            recordsMap.get(
+              systemTodayDate
+            );
+
+          return {
+            user:
+              employee,
+
+            stats:
+              evalResult.stats,
+
+            todayRecord:
+              todayRecord ||
+              null,
+
+            todayStatus:
+              todayRecord
+                ? todayRecord.checkOutTime
+                  ? 'PRESENT'
+                  : todayRecord.checkInTime
+                    ? 'CHECKED_IN'
+                    : 'NOT_CHECKED_IN'
+                : 'NOT_CHECKED_IN',
+          };
+        }
+      );
+
+    res.json({
+      todayDate:
+        systemTodayDate,
+
+      employees:
+        employeeSummaries,
+    });
   }
-});
+);
+
+// -----------------------------------------------------------------------------
+// Admin Employee Attendance Details
+// -----------------------------------------------------------------------------
+
+app.get(
+  '/api/admin/employee/:id/attendance',
+  (req: Request, res: Response) => {
+    const role =
+      req.headers[
+        'x-user-role'
+      ] as string;
+
+    if (role !== 'ADMIN') {
+      return res.status(403).json({
+        error:
+          '403 Forbidden: Access restricted strictly to users with the ADMIN role.',
+      });
+    }
+
+    const { id } =
+      req.params;
+
+    const cleanId =
+      (id || '')
+        .trim()
+        .toLowerCase();
+
+    const employee =
+      users.find(
+        (u) =>
+          u.id.toLowerCase() ===
+            cleanId ||
+          u.email.toLowerCase() ===
+            cleanId ||
+          (
+            u.employeeCode &&
+            u.employeeCode.toLowerCase() ===
+              cleanId
+          )
+      );
+
+    if (!employee) {
+      return res.status(404).json({
+        error:
+          'Employee not found',
+      });
+    }
+
+    const year =
+      2026;
+
+    const month =
+      9;
+
+    const recordsMap =
+      getEmployeeRecordsMap(
+        employee.id
+      );
+
+    const evaluation =
+      evaluateMonthlyAttendance(
+        employee.id,
+        year,
+        month,
+        recordsMap,
+        systemTodayDate
+      );
+
+    res.json({
+      employee,
+
+      year,
+
+      month,
+
+      todayDate:
+        systemTodayDate,
+
+      evaluation,
+    });
+  }
+);
+
+// -----------------------------------------------------------------------------
+// Simulation: Set System Date
+// -----------------------------------------------------------------------------
+
+app.post(
+  '/api/admin/set-system-date',
+  (req: Request, res: Response) => {
+    const { date } =
+      req.body;
+
+    if (date) {
+      systemTodayDate =
+        date;
+    }
+
+    res.json({
+      success: true,
+      systemTodayDate,
+    });
+  }
+);
+
+// -----------------------------------------------------------------------------
+// Prisma Schema
+// -----------------------------------------------------------------------------
+
+app.get(
+  '/api/schema/prisma',
+  (req: Request, res: Response) => {
+    try {
+      const schemaPath =
+        path.join(
+          process.cwd(),
+          'prisma',
+          'schema.prisma'
+        );
+
+      if (
+        fs.existsSync(
+          schemaPath
+        )
+      ) {
+        const content =
+          fs.readFileSync(
+            schemaPath,
+            'utf-8'
+          );
+
+        return res.json({
+          schema:
+            content,
+        });
+      }
+
+      res.status(404).json({
+        error:
+          'Prisma schema file not found',
+      });
+    } catch (err: any) {
+      res.status(500).json({
+        error:
+          err.message,
+      });
+    }
+  }
+);
 
 // =============================================================================
-// Vite Middleware / Static Serving
+// LOCAL DEVELOPMENT SERVER
 // =============================================================================
+
+export default app;
+
 async function startServer() {
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req: Request, res: Response) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
-  }
+  const vite =
+    await createViteServer({
+      server: {
+        middlewareMode:
+          true,
+      },
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[Attendance Tracker] Server listening on http://0.0.0.0:${PORT}`);
-  });
+      appType:
+        'spa',
+    });
+
+  app.use(
+    vite.middlewares
+  );
+
+  app.listen(
+    PORT,
+    '0.0.0.0',
+    () => {
+      console.log(
+        `[Attendance Tracker] Server listening on http://localhost:${PORT}`
+      );
+    }
+  );
 }
 
-startServer();
+// =============================================================================
+// START SERVER
+// =============================================================================
+
+// Local development:
+// Load Firestore first, then start Express + Vite.
+//
+// Vercel:
+// Do NOT call listen().
+// Vercel imports `app` directly.
+if (
+  process.env.VERCEL !== '1'
+) {
+  ensureFirestoreLoaded()
+    .then(() =>
+      startServer()
+    )
+    .catch((err) => {
+      console.error(
+        '[Firestore] Failed to initialize:',
+        err
+      );
+
+      process.exit(1);
+    });
+}
