@@ -5,16 +5,14 @@ dotenv.config({ path: '.env.local' });
 import express, { Request, Response } from 'express';
 import path from 'path';
 import fs from 'fs';
-import { createServer as createViteServer } from 'vite';
 
-import { SEED_USERS, INITIAL_RECORDS } from './store';
-import { db } from './firebaseAdmin';
+import { SEED_USERS, INITIAL_RECORDS } from './store.ts';
+import { db } from './firebaseAdmin.ts';
 
-import { User, AttendanceRecord, Role } from '../src/types';
-import { evaluateMonthlyAttendance } from '../src/utils/attendanceCalculations';
+import { User, AttendanceRecord, Role } from '../src/types.ts';
+import { evaluateMonthlyAttendance } from '../src/utils/attendanceCalculations.ts';
 
 const app = express();
-const PORT = 3000;
 
 app.use(express.json());
 
@@ -128,7 +126,7 @@ async function loadFirestoreData(): Promise<void> {
 }
 
 // Ensure Firestore is initialized before a request accesses users/records.
-async function ensureFirestoreLoaded(): Promise<void> {
+export async function ensureFirestoreLoaded(): Promise<void> {
   if (!firestoreCache.ready) {
     firestoreCache.ready = loadFirestoreData().catch((err) => {
       // Allow a future request to retry if initialization fails.
@@ -2208,37 +2206,4 @@ app.get(
   }
 );
 
-// =============================================================================
-// LOCAL DEVELOPMENT SERVER
-// =============================================================================
-
 export default app;
-
-async function startServer() {
-  const vite = await createViteServer({
-    server: {
-      middlewareMode: true,
-    },
-    appType: 'spa',
-  });
-
-  app.use(vite.middlewares);
-
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(
-      `[Attendance Tracker] Server listening on http://localhost:${PORT}`
-    );
-  });
-}
-
-if (
-  process.env.LOCAL_SERVER === 'true' &&
-  !process.env.VERCEL
-) {
-  ensureFirestoreLoaded()
-    .then(() => startServer())
-    .catch((err) => {
-      console.error('[Firestore] Failed to initialize:', err);
-      process.exit(1);
-    });
-}
