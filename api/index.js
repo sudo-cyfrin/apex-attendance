@@ -580,6 +580,7 @@ async function deleteMatchingAttendanceRecords(predicate) {
 }
 app.use("/api", async (req, res, next) => {
   try {
+    systemTodayDate = simulatedDateOverride || getISTDateString();
     await ensureFirestoreLoaded();
     next();
   } catch (err) {
@@ -661,6 +662,7 @@ function getISTDateString(d = /* @__PURE__ */ new Date()) {
 }
 var SYSTEM_LAUNCH_DATE = "2026-09-04";
 var systemTodayDate = getISTDateString();
+var simulatedDateOverride = null;
 function findRecordForUser(userId, date) {
   const cleanId = (userId || "").trim().toLowerCase();
   const targetUser = users.find(
@@ -1562,12 +1564,12 @@ app.post(
   "/api/admin/set-system-date",
   (req, res) => {
     const { date } = req.body;
-    if (date) {
-      systemTodayDate = date;
-    }
+    simulatedDateOverride = date || null;
+    systemTodayDate = simulatedDateOverride || getISTDateString();
     res.json({
       success: true,
-      systemTodayDate
+      systemTodayDate,
+      simulated: simulatedDateOverride !== null
     });
   }
 );

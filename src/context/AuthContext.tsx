@@ -85,28 +85,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           await setDoc(adminDocRef, { userId: fbUser.uid, email: userEmail, createdAt: serverTimestamp() }, { merge: true });
         }
 
-        // Guarantee attendance_records collection exists and is visible in Firestore console
-        try {
-          const recRef = doc(db, 'attendance_records', `${fbUser.uid}_2026-09-04`);
-          const recSnap = await getDoc(recRef);
-          if (!recSnap.exists()) {
-            await setDoc(recRef, {
-              id: `${fbUser.uid}_2026-09-04`,
-              userId: fbUser.uid,
-              date: '2026-09-04',
-              status: 'PRESENT',
-              checkInTime: null,
-              checkOutTime: null,
-              hoursWorked: 0,
-              notes: 'Active Workday - September 4, 2026',
-              createdAt: serverTimestamp(),
-              updatedAt: serverTimestamp(),
-            });
-          }
-        } catch (attErr) {
-          console.warn('Initial attendance sync note:', attErr);
-        }
-
         return userObj;
       } else {
         // Create new user profile document in Firestore
@@ -132,28 +110,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         if (defaultRole === 'ADMIN') {
           const adminDocRef = doc(db, 'admins', fbUser.uid);
           await setDoc(adminDocRef, { userId: fbUser.uid, email: userEmail, createdAt: serverTimestamp() }, { merge: true });
-        }
-
-        // Guarantee attendance_records collection exists and is visible in Firestore console
-        try {
-          const recRef = doc(db, 'attendance_records', `${fbUser.uid}_2026-09-04`);
-          const recSnap = await getDoc(recRef);
-          if (!recSnap.exists()) {
-            await setDoc(recRef, {
-              id: `${fbUser.uid}_2026-09-04`,
-              userId: fbUser.uid,
-              date: '2026-09-04',
-              status: 'PRESENT',
-              checkInTime: null,
-              checkOutTime: null,
-              hoursWorked: 0,
-              notes: 'Active Workday - September 4, 2026',
-              createdAt: serverTimestamp(),
-              updatedAt: serverTimestamp(),
-            });
-          }
-        } catch (attErr) {
-          console.warn('Initial attendance sync note:', attErr);
         }
 
         return newUserObj;

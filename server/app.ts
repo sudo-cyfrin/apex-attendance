@@ -204,6 +204,11 @@ async function deleteMatchingAttendanceRecords(
 
 app.use('/api', async (req, res, next) => {
   try {
+    // Refresh "today" on every request instead of relying on the
+    // value computed at container cold-start, which otherwise goes
+    // stale once the real date rolls over while the function stays warm.
+    systemTodayDate = simulatedDateOverride || getISTDateString();
+
     await ensureFirestoreLoaded();
     next();
   } catch (err) {
@@ -379,8 +384,12 @@ export function getISTDateString(
 // Portal launch date.
 export const SYSTEM_LAUNCH_DATE = '2026-09-04';
 
-// Active system date.
+// Active system date. Recomputed on every request (see the '/api'
+// middleware below) so it never goes stale in a warm serverless
+// container. `simulatedDateOverride` lets the admin "set system date"
+// endpoint pin a specific date for demo/testing purposes.
 let systemTodayDate = getISTDateString();
+let simulatedDateOverride: string | null = null;
 
 // =============================================================================
 // ATTENDANCE HELPERS
@@ -2149,14 +2158,15 @@ app.post(
     const { date } =
       req.body;
 
-    if (date) {
-      systemTodayDate =
-        date;
-    }
+    // Setting an empty/falsy date clears the simulation and
+    // reverts to the real IST date on the next request.
+    simulatedDateOverride = date || null;
+    systemTodayDate = simulatedDateOverride || getISTDateString();
 
     res.json({
       success: true,
       systemTodayDate,
+      simulated: simulatedDateOverride !== null,
     });
   }
 );
