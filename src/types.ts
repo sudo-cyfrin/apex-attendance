@@ -71,6 +71,26 @@ export interface DayAttendanceInfo {
   compensatedBySunday?: boolean;
 }
 
+export interface PayrollSummary {
+  userId: string;
+  year: number;
+  month: number;
+  monthlySalary: number;
+  workingDays: number;
+  sundaysInMonth: number;
+  dailySalary: number;
+  carryInLeaves: number;
+  paidLeaveAllowance: number;
+  paidLeavesUsed: number;
+  unpaidLeaves: number;
+  sundayExtraDays: number;
+  extraPay: number;
+  deduction: number;
+  netSalary: number;
+  remainingLeaveBalance: number;
+  updatedAt?: string;
+}
+
 export interface MonthlyStats {
   averageHoursLoggedIn: string; // Formatted e.g. "8h 15m" or "0h"
   averageHoursDecimal: number; // e.g. 8.25
@@ -84,6 +104,10 @@ export interface MonthlyStats {
   totalWorkingDaysPassed: number;
   presentDaysCount: number;
   totalHoursWorked: number;
+  sundaysInMonth: number;
+  workingDaysInMonth: number;
+  carryInLeaves: number;
+  remainingLeaveBalance: number;
 }
 
 export interface MonthEvaluationResult {

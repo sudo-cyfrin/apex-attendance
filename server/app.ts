@@ -9,7 +9,7 @@ import fs from 'fs';
 import { SEED_USERS, INITIAL_RECORDS } from './store.ts';
 import { db } from './firebaseAdmin.ts';
 
-import { User, AttendanceRecord, Role } from '../src/types.ts';
+import { User, AttendanceRecord, Role, PayrollSummary } from '../src/types.ts';
 import { evaluateMonthlyAttendance } from '../src/utils/attendanceCalculations.ts';
 
 const app = express();
@@ -22,6 +22,7 @@ app.use(express.json());
 
 const usersCollection = db.collection('users');
 const attendanceCollection = db.collection('attendance_records');
+const payrollCollection = db.collection('payroll_records');
 
 // Firestore-backed local cache.
 // Firestore is the persistent source of truth.
@@ -136,6 +137,144 @@ export async function ensureFirestoreLoaded(): Promise<void> {
   }
 
   await firestoreCache.ready;
+}
+
+// =============================================================================
+// PAYROLL / SALARY HELPERS
+// =============================================================================
+
+function payrollDocId(userId: string, year: number, month: number): string {
+  return `${userId}_${year}_${String(month).padStart(2, '0')}`;
+}
+
+function previousMonth(year: number, month: number): { year: number; month: number } {
+  return month === 1
+    ? { year: year - 1, month: 12 }
+    : { year, month: month - 1 };
+}
+
+function getUserByIdentifier(identifier: string): User | undefined {
+  const clean = (identifier || '').trim().toLowerCase();
+  return users.find((u) =>
+    u.id.toLowerCase() === clean ||
+    u.email.toLowerCase() === clean ||
+    (u.employeeCode || '').toLowerCase() === clean
+  );
+}
+
+async function getStoredMonthlySalary(userId: string, year: number, month: number): Promise<number> {
+  const snap = await payrollCollection.doc(payrollDocId(userId, year, month)).get();
+  if (!snap.exists) return 0;
+  const value = Number(snap.data()?.monthlySalary);
+  return Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+// Leave balance is carried forward from the previous month's final allowance
+// after paid leaves have been used. Sunday shift credits are part of that balance.
+async function getCarryInLeaves(userId: string, year: number, month: number, depth = 0): Promise<number> {
+  if (depth > 120) return 0;
+
+  const user = getUserByIdentifier(userId);
+  const previous = previousMonth(year, month);
+
+  // Do not carry leave from before an employee joined.
+  if (user?.joinedDate && `${previous.year}-${String(previous.month).padStart(2, '0')}-01` < `${user.joinedDate.slice(0, 7)}-01`) {
+    return 0;
+  }
+
+  // The portal launched in September 2026. Earlier months are not part of payroll.
+  if (previous.year < 2026 || (previous.year === 2026 && previous.month < 9)) {
+    return 0;
+  }
+
+  const priorCarry = await getCarryInLeaves(userId, previous.year, previous.month, depth + 1);
+  const priorRecords = getEmployeeRecordsMap(userId);
+  const priorEvaluation = evaluateMonthlyAttendance(
+    userId,
+    previous.year,
+    previous.month,
+    priorRecords,
+    `${previous.year}-${String(previous.month).padStart(2, '0')}-${new Date(previous.year, previous.month, 0).getDate()}`,
+    priorCarry
+  );
+
+  return Math.max(0, priorEvaluation.stats.remainingLeaveBalance);
+}
+
+async function calculatePayroll(
+  userId: string,
+  year: number,
+  month: number,
+  monthlySalary?: number
+): Promise<PayrollSummary> {
+  const carryInLeaves = await getCarryInLeaves(userId, year, month);
+  const recordsMap = getEmployeeRecordsMap(userId);
+
+  const daysInMonth = new Date(year, month, 0).getDate();
+  const sundaysInMonth = Array.from({ length: daysInMonth }, (_, i) =>
+    new Date(year, month - 1, i + 1).getDay()
+  ).filter((day) => day === 0).length;
+  const workingDays = daysInMonth - sundaysInMonth;
+
+  const storedSalary = await getStoredMonthlySalary(userId, year, month);
+  const salary = monthlySalary !== undefined ? monthlySalary : storedSalary;
+
+  const evaluation = evaluateMonthlyAttendance(
+    userId,
+    year,
+    month,
+    recordsMap,
+    systemTodayDate,
+    carryInLeaves
+  );
+
+  const dailySalary = workingDays > 0 ? salary / workingDays : 0;
+
+  // Exactly 2 paid leaves are allowed per month.
+  // Carry-forward leaves are still available as an additional balance.
+  const paidLeaveAllowance = 2;
+  const paidLeavesUsed = evaluation.stats.paidLeavesUsed;
+  const unpaidLeaves = Math.max(0, evaluation.stats.unpaidLeaves);
+
+  // Sunday shifts earn +1 day salary each.
+  const sundayExtraDays = evaluation.stats.sundayCompensationsEarned;
+
+  // Required payroll formula:
+  // newSalary = baseSalary + oneDaySalary * (sundayCredits - unpaidLeaves)
+  const salaryAdjustmentDays = sundayExtraDays - unpaidLeaves;
+  const netSalary = salary + dailySalary * salaryAdjustmentDays;
+
+  // Breakdown values for the UI.
+  const extraPay = dailySalary * sundayExtraDays;
+  const deduction = dailySalary * unpaidLeaves;
+
+  const summary: PayrollSummary = {
+    userId,
+    year,
+    month,
+    monthlySalary: Math.round(salary * 100) / 100,
+    workingDays,
+    sundaysInMonth,
+    dailySalary: Math.round(dailySalary * 100) / 100,
+    carryInLeaves,
+    paidLeaveAllowance,
+    paidLeavesUsed,
+    unpaidLeaves,
+    sundayExtraDays,
+    extraPay: Math.round(extraPay * 100) / 100,
+    deduction: Math.round(deduction * 100) / 100,
+    netSalary: Math.round(netSalary * 100) / 100,
+    remainingLeaveBalance: evaluation.stats.remainingLeaveBalance,
+    updatedAt: new Date().toISOString(),
+  };
+
+  return summary;
+}
+
+async function savePayroll(summary: PayrollSummary): Promise<void> {
+  await payrollCollection.doc(payrollDocId(summary.userId, summary.year, summary.month)).set(summary, {
+    merge: true,
+  });
 }
 
 // =============================================================================
@@ -1954,14 +2093,21 @@ app.get(
         userId
       );
 
+    const carryInLeaves =
+      await getCarryInLeaves(userId, y, m);
+
     const evaluation =
       evaluateMonthlyAttendance(
         userId,
         y,
         m,
         recordsMap,
-        systemTodayDate
+        systemTodayDate,
+        carryInLeaves
       );
+
+    const payroll =
+      await calculatePayroll(userId, y, m);
 
     res.json({
       user,
@@ -1976,6 +2122,88 @@ app.get(
         systemTodayDate,
 
       evaluation,
+      payroll,
+    });
+  }
+);
+
+// -----------------------------------------------------------------------------
+// Payroll / Salary
+// -----------------------------------------------------------------------------
+
+app.get(
+  '/api/payroll/:userId/:year/:month',
+  async (req: Request, res: Response) => {
+    const { userId, year: yearParam, month: monthParam } = req.params;
+    const requestedRole = (req.query.role as string || req.headers['x-user-role'] as string || '').toUpperCase();
+    const requestedEmail = (req.query.email as string || '').trim().toLowerCase();
+
+    const targetUser = getUserByIdentifier(userId);
+    if (!targetUser) {
+      return res.status(404).json({ error: 'Employee not found' });
+    }
+
+    // Employees can only read their own payroll. Admins can inspect anyone.
+    const isAdminRequest = requestedRole === 'ADMIN';
+    if (!isAdminRequest && requestedEmail && targetUser.email.toLowerCase() !== requestedEmail) {
+      return res.status(403).json({ error: 'Payroll access denied' });
+    }
+
+    if (!isAdminRequest && userId !== targetUser.id && userId.toLowerCase() !== targetUser.email.toLowerCase()) {
+      return res.status(403).json({ error: 'Payroll access denied' });
+    }
+
+    const year = parseInt(yearParam, 10);
+    const month = parseInt(monthParam, 10);
+    if (!Number.isInteger(year) || !Number.isInteger(month) || month < 1 || month > 12) {
+      return res.status(400).json({ error: 'Invalid year or month' });
+    }
+
+    const payroll = await calculatePayroll(targetUser.id, year, month);
+    const snap = await payrollCollection.doc(payrollDocId(targetUser.id, year, month)).get();
+
+    res.json({
+      payroll,
+      configured: snap.exists && Number(snap.data()?.monthlySalary) > 0,
+    });
+  }
+);
+
+app.post(
+  '/api/admin/payroll/:userId',
+  async (req: Request, res: Response) => {
+    const role = req.headers['x-user-role'] as string;
+    if (role !== 'ADMIN') {
+      return res.status(403).json({ error: '403 Forbidden: Admin access required.' });
+    }
+
+    const { userId } = req.params;
+    const { year, month, monthlySalary } = req.body;
+    const targetUser = getUserByIdentifier(userId);
+
+    if (!targetUser) {
+      return res.status(404).json({ error: 'Employee not found' });
+    }
+
+    const y = Number(year);
+    const m = Number(month);
+    const salary = Number(monthlySalary);
+
+    if (!Number.isInteger(y) || !Number.isInteger(m) || m < 1 || m > 12) {
+      return res.status(400).json({ error: 'Invalid year or month' });
+    }
+
+    if (!Number.isFinite(salary) || salary < 0) {
+      return res.status(400).json({ error: 'Monthly salary must be a valid non-negative number' });
+    }
+
+    const payroll = await calculatePayroll(targetUser.id, y, m, salary);
+    await savePayroll(payroll);
+
+    res.json({
+      success: true,
+      message: `Salary updated for ${targetUser.name}.`,
+      payroll,
     });
   }
 );
@@ -1986,7 +2214,7 @@ app.get(
 
 app.get(
   '/api/admin/employees',
-  (req: Request, res: Response) => {
+  async (req: Request, res: Response) => {
     const role =
       req.headers[
         'x-user-role'
@@ -1999,11 +2227,11 @@ app.get(
       });
     }
 
-    const year =
-      2026;
+    const [currentYear, currentMonth] =
+      systemTodayDate.split('-').map(Number);
 
-    const month =
-      9;
+    const year = currentYear;
+    const month = currentMonth;
 
     users =
       deduplicateUsers(
@@ -2011,48 +2239,67 @@ app.get(
       );
 
     const employeeSummaries =
-      users.map(
-        (employee) => {
-          const recordsMap =
-            getEmployeeRecordsMap(
-              employee.id
-            );
+      await Promise.all(
+        users.map(
+          async (employee) => {
+            const recordsMap =
+              getEmployeeRecordsMap(
+                employee.id
+              );
 
-          const evalResult =
-            evaluateMonthlyAttendance(
-              employee.id,
-              year,
-              month,
-              recordsMap,
-              systemTodayDate
-            );
+            const carryInLeaves =
+              await getCarryInLeaves(
+                employee.id,
+                year,
+                month
+              );
 
-          const todayRecord =
-            recordsMap.get(
-              systemTodayDate
-            );
+            const evalResult =
+              evaluateMonthlyAttendance(
+                employee.id,
+                year,
+                month,
+                recordsMap,
+                systemTodayDate,
+                carryInLeaves
+              );
 
-          return {
-            user:
-              employee,
+            const payroll =
+              await calculatePayroll(
+                employee.id,
+                year,
+                month
+              );
 
-            stats:
-              evalResult.stats,
+            const todayRecord =
+              recordsMap.get(
+                systemTodayDate
+              );
 
-            todayRecord:
-              todayRecord ||
-              null,
+            return {
+              user:
+                employee,
 
-            todayStatus:
-              todayRecord
-                ? todayRecord.checkOutTime
-                  ? 'PRESENT'
-                  : todayRecord.checkInTime
-                    ? 'CHECKED_IN'
-                    : 'NOT_CHECKED_IN'
-                : 'NOT_CHECKED_IN',
-          };
-        }
+              stats:
+                evalResult.stats,
+
+              payroll,
+
+              todayRecord:
+                todayRecord ||
+                null,
+
+              todayStatus:
+                todayRecord
+                  ? todayRecord.checkOutTime
+                    ? 'PRESENT'
+                    : todayRecord.checkInTime
+                      ? 'CHECKED_IN'
+                      : 'NOT_CHECKED_IN'
+                  : 'NOT_CHECKED_IN',
+            };
+          }
+        )
       );
 
     res.json({
@@ -2071,7 +2318,7 @@ app.get(
 
 app.get(
   '/api/admin/employee/:id/attendance',
-  (req: Request, res: Response) => {
+  async (req: Request, res: Response) => {
     const role =
       req.headers[
         'x-user-role'
@@ -2113,15 +2360,22 @@ app.get(
       });
     }
 
-    const year =
-      2026;
+    const [currentYear, currentMonth] =
+      systemTodayDate.split('-').map(Number);
 
-    const month =
-      9;
+    const year = currentYear;
+    const month = currentMonth;
 
     const recordsMap =
       getEmployeeRecordsMap(
         employee.id
+      );
+
+    const carryInLeaves =
+      await getCarryInLeaves(
+        employee.id,
+        year,
+        month
       );
 
     const evaluation =
@@ -2130,7 +2384,15 @@ app.get(
         year,
         month,
         recordsMap,
-        systemTodayDate
+        systemTodayDate,
+        carryInLeaves
+      );
+
+    const payroll =
+      await calculatePayroll(
+        employee.id,
+        year,
+        month
       );
 
     res.json({
@@ -2144,6 +2406,7 @@ app.get(
         systemTodayDate,
 
       evaluation,
+      payroll,
     });
   }
 );

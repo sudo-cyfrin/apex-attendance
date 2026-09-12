@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../context/AuthContext.tsx';
-import { User, DayAttendanceInfo, MonthEvaluationResult } from '../types.ts';
+import { User, DayAttendanceInfo, MonthEvaluationResult, PayrollSummary } from '../types.ts';
 import {
   ShieldAlert,
   Search,
@@ -14,6 +14,8 @@ import {
   Plus,
   UserPlus,
   RefreshCw,
+  IndianRupee,
+  CalendarDays,
 } from 'lucide-react';
 import {
   collection,
@@ -40,6 +42,7 @@ interface EmployeeSummaryData {
     incompleteCheckoutsCount: number;
     totalHoursWorked: number;
   };
+  payroll?: PayrollSummary;
   todayRecord: any;
   todayStatus: string;
 }
@@ -60,6 +63,14 @@ export const AdminDashboard: React.FC = () => {
   const [newEmpTitle, setNewEmpTitle] = useState('Senior Engineer');
   const [isAdding, setIsAdding] = useState(false);
 
+  // Monthly salary editor
+  const [showSalaryModal, setShowSalaryModal] = useState(false);
+  const [salaryEmployee, setSalaryEmployee] = useState<EmployeeSummaryData | null>(null);
+  const [salaryYear, setSalaryYear] = useState(new Date().getFullYear());
+  const [salaryMonth, setSalaryMonth] = useState(new Date().getMonth() + 1);
+  const [salaryInput, setSalaryInput] = useState('');
+  const [isSavingSalary, setIsSavingSalary] = useState(false);
+
   // Slide-over inspect state
   const [selectedEmployeeId, setSelectedEmployeeId] = useState<string | null>(
     null
@@ -70,6 +81,7 @@ export const AdminDashboard: React.FC = () => {
     year: number;
     month: number;
     evaluation: MonthEvaluationResult;
+    payroll?: PayrollSummary;
   } | null>(null);
 
   const [inspectDay, setInspectDay] = useState<DayAttendanceInfo | null>(null);
@@ -127,6 +139,55 @@ export const AdminDashboard: React.FC = () => {
   useEffect(() => {
     fetchEmployees();
   }, [isAdmin, currentUser]);
+
+  const openSalaryEditor = (employee: EmployeeSummaryData) => {
+    const p = employee.payroll;
+    const now = new Date();
+    setSalaryEmployee(employee);
+    setSalaryYear(p?.year || now.getFullYear());
+    setSalaryMonth(p?.month || now.getMonth() + 1);
+    setSalaryInput(p && p.monthlySalary > 0 ? String(p.monthlySalary) : '');
+    setShowSalaryModal(true);
+  };
+
+  const handleSaveSalary = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!currentUser || !salaryEmployee) return;
+
+    const salary = Number(salaryInput);
+    if (!Number.isFinite(salary) || salary < 0) return;
+
+    setIsSavingSalary(true);
+    try {
+      const res = await fetch(`/api/admin/payroll/${salaryEmployee.user.id}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-user-role': currentUser.role,
+        },
+        body: JSON.stringify({
+          year: salaryYear,
+          month: salaryMonth,
+          monthlySalary: salary,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        console.error(data.error || 'Failed to update salary');
+        return;
+      }
+
+      setShowSalaryModal(false);
+      setSalaryEmployee(null);
+      setSalaryInput('');
+      await fetchEmployees();
+    } catch (err) {
+      console.error('Failed to update salary:', err);
+    } finally {
+      setIsSavingSalary(false);
+    }
+  };
 
   // Load detailed employee attendance for slide-over
   const inspectEmployee = async (employeeId: string) => {
@@ -324,7 +385,7 @@ export const AdminDashboard: React.FC = () => {
               </span>
 
               <span className="text-xs text-slate-400">
-                September 2026
+                Current Month
               </span>
 
             </div>
@@ -513,6 +574,10 @@ export const AdminDashboard: React.FC = () => {
 
                   <th className="py-4 px-4">
                     Leaves Taken (Orange/Red)
+                  </th>
+
+                  <th className="py-4 px-4">
+                    Salary
                   </th>
 
                   <th className="py-4 px-4">
@@ -706,6 +771,30 @@ export const AdminDashboard: React.FC = () => {
 
                       </td>
 
+                      {/* Salary */}
+                      <td className="py-4 px-4">
+                        <div className="font-mono font-semibold text-white">
+                          {emp.payroll && emp.payroll.monthlySalary > 0
+                            ? `₹${emp.payroll.monthlySalary.toLocaleString('en-IN')}`
+                            : 'Not set'}
+                        </div>
+                        {emp.payroll && emp.payroll.monthlySalary > 0 && (
+                          <div className="text-[11px] text-emerald-300 mt-0.5">
+                            Net ₹{emp.payroll.netSalary.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
+                          </div>
+                        )}
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            openSalaryEditor(emp);
+                          }}
+                          className="mt-1 inline-flex items-center space-x-1 text-[11px] font-semibold text-purple-300 hover:text-white"
+                        >
+                          <IndianRupee className="w-3 h-3" />
+                          <span>{emp.payroll?.monthlySalary ? 'Edit' : 'Set salary'}</span>
+                        </button>
+                      </td>
+
                       {/* Incomplete Logs */}
                       <td className="py-4 px-4">
 
@@ -806,6 +895,103 @@ export const AdminDashboard: React.FC = () => {
         )}
 
       </div>
+
+      {/* Monthly Salary Modal */}
+      {showSalaryModal && salaryEmployee && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
+          <div className="w-full max-w-md bg-[#0F172A] border border-emerald-500/20 rounded-2xl p-6 shadow-2xl relative">
+            <button
+              onClick={() => setShowSalaryModal(false)}
+              className="absolute top-4 right-4 p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800"
+            >
+              <X className="w-4 h-4" />
+            </button>
+
+            <div className="flex items-center gap-3 mb-1">
+              <div className="w-10 h-10 rounded-xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
+                <IndianRupee className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-lg font-semibold text-white">Set Monthly Salary</h3>
+                <p className="text-xs text-slate-400">{salaryEmployee.user.name}</p>
+              </div>
+            </div>
+
+            <form onSubmit={handleSaveSalary} className="space-y-4 mt-5">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-slate-300 mb-1">Year</label>
+                  <input
+                    type="number"
+                    value={salaryYear}
+                    onChange={(e) => setSalaryYear(Number(e.target.value))}
+                    min="2020"
+                    max="2100"
+                    required
+                    className="w-full px-3.5 py-2 rounded-xl bg-slate-900 border border-white/10 text-sm text-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-300 mb-1">Month</label>
+                  <select
+                    value={salaryMonth}
+                    onChange={(e) => setSalaryMonth(Number(e.target.value))}
+                    className="w-full px-3.5 py-2 rounded-xl bg-slate-900 border border-white/10 text-sm text-white"
+                  >
+                    {Array.from({ length: 12 }, (_, i) => (
+                      <option key={i + 1} value={i + 1}>
+                        {new Date(2000, i, 1).toLocaleString('en-IN', { month: 'long' })}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1">Monthly Salary (₹)</label>
+                <input
+                  type="number"
+                  value={salaryInput}
+                  onChange={(e) => setSalaryInput(e.target.value)}
+                  min="0"
+                  step="0.01"
+                  placeholder="e.g. 35000"
+                  required
+                  className="w-full px-3.5 py-2 rounded-xl bg-slate-900 border border-white/10 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500"
+                />
+              </div>
+
+              <div className="rounded-xl bg-slate-900/70 border border-white/5 p-3 text-[11px] text-slate-400">
+                <div className="flex items-center gap-2 text-slate-300 font-semibold mb-1">
+                  <CalendarDays className="w-3.5 h-3.5 text-emerald-400" />
+                  Automatic payroll rules
+                </div>
+                <div>Daily rate = monthly salary ÷ non-Sunday working days.</div>
+                <div>First 2 leaves are paid; unused leave carries forward.</div>
+                <div>Completed Sunday shifts add one daily rate to salary.</div>
+                <div>Leaves beyond the available balance are deducted.</div>
+              </div>
+
+              <div className="flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowSalaryModal(false)}
+                  className="px-4 py-2 rounded-xl bg-slate-800 text-xs font-medium text-slate-300 hover:text-white"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSavingSalary}
+                  className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-semibold"
+                >
+                  {isSavingSalary ? 'Saving...' : 'Save Salary'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {/* Add Employee Modal */}
       {showAddModal && (
@@ -1031,8 +1217,58 @@ export const AdminDashboard: React.FC = () => {
                     employeeDetails
                       .evaluation.stats
                   }
-                  monthName="September 2026"
+                  monthName={new Date(
+                    employeeDetails.year,
+                    employeeDetails.month - 1,
+                    1
+                  ).toLocaleString('en-IN', {
+                    month: 'long',
+                    year: 'numeric',
+                  })}
                 />
+
+                {employeeDetails.payroll && employeeDetails.payroll.monthlySalary > 0 && (
+                  <div className="mb-6 rounded-2xl border border-emerald-500/20 bg-emerald-950/20 p-5">
+                    <div className="flex items-center justify-between gap-3 mb-4">
+                      <div>
+                        <div className="text-xs uppercase tracking-wider text-emerald-400 font-semibold">Monthly Payroll</div>
+                        <div className="text-2xl font-extrabold text-white mt-1">
+                          ₹{employeeDetails.payroll.netSalary.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => {
+                          const emp = employees.find((e) => e.user.id === employeeDetails.employee.id);
+                          if (emp) openSalaryEditor(emp);
+                        }}
+                        className="px-3 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-xs font-semibold"
+                      >
+                        Edit Salary
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+                      <div className="rounded-xl bg-slate-900/70 p-3 border border-white/5">
+                        <div className="text-slate-500">Daily Rate</div>
+                        <div className="text-white font-semibold mt-1">₹{employeeDetails.payroll.dailySalary.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</div>
+                      </div>
+                      <div className="rounded-xl bg-slate-900/70 p-3 border border-white/5">
+                        <div className="text-slate-500">Sundays</div>
+                        <div className="text-white font-semibold mt-1">{employeeDetails.payroll.sundaysInMonth}</div>
+                      </div>
+                      <div className="rounded-xl bg-slate-900/70 p-3 border border-white/5">
+                        <div className="text-slate-500">Extra Sunday Pay</div>
+                        <div className="text-fuchsia-300 font-semibold mt-1">+₹{employeeDetails.payroll.extraPay.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</div>
+                      </div>
+                      <div className="rounded-xl bg-slate-900/70 p-3 border border-white/5">
+                        <div className="text-slate-500">Deduction</div>
+                        <div className="text-red-300 font-semibold mt-1">-₹{employeeDetails.payroll.deduction.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</div>
+                      </div>
+                    </div>
+                    <div className="mt-3 text-[11px] text-slate-400">
+                      {employeeDetails.payroll.paidLeavesUsed}/{employeeDetails.payroll.paidLeaveAllowance} paid leaves used • {employeeDetails.payroll.remainingLeaveBalance} leave days carry forward
+                    </div>
+                  </div>
+                )}
 
                 {/* Sunday Shift Compensation Audit Trail */}
                 {employeeDetails.evaluation

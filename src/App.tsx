@@ -13,6 +13,7 @@ import {
   DayAttendanceInfo,
   MonthEvaluationResult,
   AttendanceRecord,
+  PayrollSummary,
 } from './types.ts';
 import {
   CheckCircle2,
@@ -117,6 +118,9 @@ function AttendanceApp() {
 
   const [monthEvaluation, setMonthEvaluation] =
     useState<MonthEvaluationResult | null>(null);
+
+  const [payroll, setPayroll] =
+    useState<PayrollSummary | null>(null);
 
   const [selectedDay, setSelectedDay] =
     useState<DayAttendanceInfo | null>(null);
@@ -336,6 +340,7 @@ function AttendanceApp() {
       const data = await res.json();
 
       setMonthEvaluation(data.evaluation);
+      setPayroll(data.payroll || null);
 
       // IMPORTANT:
       // Do NOT overwrite todayDateStr from the API.
@@ -461,6 +466,36 @@ function AttendanceApp() {
     currentUser,
     todayDateStr,
   ]);
+
+  // ============================================================
+  // REAL-TIME SALARY / PAYROLL SYNC
+  //
+  // When an administrator changes salary, the employee's
+  // dashboard updates automatically through Firestore.
+  // ============================================================
+  useEffect(() => {
+    if (!currentUser) return;
+
+    const payrollRef = doc(
+      db,
+      'payroll_records',
+      `${currentUser.id}_${year}_${String(month).padStart(2, '0')}`
+    );
+
+    const unsubscribe = onSnapshot(
+      payrollRef,
+      (snap) => {
+        if (snap.exists()) {
+          setPayroll(snap.data() as PayrollSummary);
+        }
+      },
+      (err) => {
+        console.warn('Firestore payroll onSnapshot note:', err);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [currentUser, year, month]);
 
   // ============================================================
   // CHECK IN HANDLER
@@ -898,6 +933,57 @@ function AttendanceApp() {
                     month
                   )}
                 />
+              )}
+
+              {/* =================================================
+                  MONTHLY SALARY / PAYROLL
+              ================================================= */}
+              {payroll && payroll.monthlySalary > 0 && (
+                <div className="relative overflow-hidden rounded-2xl p-5 sm:p-6 glass-card border border-emerald-500/20 shadow-xl">
+                  <div className="absolute top-0 right-0 w-56 h-56 bg-emerald-500/10 rounded-full blur-3xl pointer-events-none" />
+                  <div className="relative z-10">
+                    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-5">
+                      <div>
+                        <div className="text-xs font-semibold uppercase tracking-wider text-emerald-400">
+                          {formatMonthName(year, month)} Salary
+                        </div>
+                        <div className="text-3xl font-extrabold text-white mt-1">
+                          ₹{payroll.netSalary.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        </div>
+                        <div className="text-xs text-slate-400 mt-1">
+                          Updated salary • Base ₹{payroll.monthlySalary.toLocaleString('en-IN')} • ₹{payroll.dailySalary.toLocaleString('en-IN', { maximumFractionDigits: 2 })}/working day
+                        </div>
+                      </div>
+                      <div className="px-3 py-2 rounded-xl bg-slate-900/70 border border-white/10 text-xs text-slate-300">
+                        <div>{payroll.sundaysInMonth} Sundays • {payroll.workingDays} working days</div>
+                        <div className="mt-1">Leave balance: <span className="text-emerald-300 font-semibold">{payroll.remainingLeaveBalance}</span></div>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                      <div className="rounded-xl bg-slate-900/60 border border-white/5 p-3">
+                        <div className="text-[11px] text-slate-500 uppercase">Carry In</div>
+                        <div className="text-lg font-bold text-white mt-1">{payroll.carryInLeaves} days</div>
+                      </div>
+                      <div className="rounded-xl bg-slate-900/60 border border-white/5 p-3">
+                        <div className="text-[11px] text-slate-500 uppercase">Paid Leaves</div>
+                        <div className="text-lg font-bold text-orange-300 mt-1">{payroll.paidLeavesUsed}/{payroll.paidLeaveAllowance}</div>
+                      </div>
+                      <div className="rounded-xl bg-slate-900/60 border border-white/5 p-3">
+                        <div className="text-[11px] text-slate-500 uppercase">Extra Work</div>
+                        <div className="text-lg font-bold text-fuchsia-300 mt-1">+₹{payroll.extraPay.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</div>
+                      </div>
+                      <div className="rounded-xl bg-slate-900/60 border border-white/5 p-3">
+                        <div className="text-[11px] text-slate-500 uppercase">Leave Deduction</div>
+                        <div className="text-lg font-bold text-red-300 mt-1">-₹{payroll.deduction.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</div>
+                      </div>
+                    </div>
+
+                    <div className="mt-4 text-[11px] text-slate-400">
+                      Two paid leaves are included each month. Unused leave carries forward. Completed Sunday shifts are paid as extra days and also add one leave credit.
+                    </div>
+                  </div>
+                </div>
               )}
 
               {/* =================================================

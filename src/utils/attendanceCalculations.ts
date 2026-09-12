@@ -221,7 +221,8 @@ export function evaluateMonthlyAttendance(
   year: number,
   month: number, // 1 to 12
   recordsMap: Map<string, AttendanceRecord>,
-  todayDateStr: string // "YYYY-MM-DD"
+  todayDateStr: string, // "YYYY-MM-DD"
+  carryInLeaves = 0
 ): MonthEvaluationResult {
   const daysInMonth = new Date(year, month, 0).getDate();
 
@@ -265,7 +266,7 @@ export function evaluateMonthlyAttendance(
 
   const sundayCredits = sundayShiftDates.length;
   // Baseline paid leaves allowance is 2 + any earned Sunday credits
-  const totalPaidAllowance = 2 + sundayCredits;
+  const totalPaidAllowance = 2 + Math.max(0, carryInLeaves);
 
   // Step 2: Traverse all days of the month and catalog weekday absences and records
   const evaluatedDays: DayAttendanceInfo[] = [];
@@ -422,10 +423,9 @@ export function evaluateMonthlyAttendance(
     });
   }
 
-  // Step 3: Apply Leave Allocation & Sunday Compensation offset to weekday absences
-  // Absence index 0 & 1 -> Paid Leave (Orange).
-  // If sundayCredits > 0, absences 2, 3, etc. up to totalPaidAllowance - 1 remain Paid Leave (Orange)!
-  // Beyond totalPaidAllowance -> Unpaid Leave (Red).
+  // Step 3: Apply the monthly paid-leave allowance to weekday absences.
+  // Exactly 2 paid leaves are available each month, plus carried-forward leaves.
+  // Sunday work is a salary credit only and does NOT increase the paid-leave allowance.
   let paidLeavesUsed = 0;
   let unpaidLeavesUsed = 0;
 
@@ -434,22 +434,11 @@ export function evaluateMonthlyAttendance(
     if (!dayItem) return;
 
     const isCoveredByQuota = index < totalPaidAllowance;
-    const isCompensatedBySunday = index >= 2 && index < totalPaidAllowance;
 
     if (isCoveredByQuota) {
       paidLeavesUsed++;
       dayItem.computedStatus = 'PAID_LEAVE';
-      if (isCompensatedBySunday) {
-        dayItem.statusLabel = `Paid Leave (${index + 1}/${totalPaidAllowance} - Sunday Shift Credit Applied)`;
-        dayItem.compensatedBySunday = true;
-        // Connect to audit trail
-        const auditIndex = index - 2;
-        if (leaveAudits[auditIndex]) {
-          leaveAudits[auditIndex].appliedToLeaveDate = absentDateStr;
-        }
-      } else {
-        dayItem.statusLabel = `Paid Leave (${index + 1}/${totalPaidAllowance})`;
-      }
+      dayItem.statusLabel = `Paid Leave (${index + 1}/${totalPaidAllowance})`;
       dayItem.themeStyle = getThemeStyleForStatus('PAID_LEAVE');
     } else {
       unpaidLeavesUsed++;
@@ -477,6 +466,10 @@ export function evaluateMonthlyAttendance(
     totalWorkingDaysPassed: workingDaysPassed,
     presentDaysCount,
     totalHoursWorked: Math.round(totalHoursWorked * 10) / 10,
+    sundaysInMonth: daysInMonth === 0 ? 0 : Array.from({ length: daysInMonth }, (_, i) => new Date(year, month - 1, i + 1).getDay()).filter((d) => d === 0).length,
+    workingDaysInMonth: daysInMonth === 0 ? 0 : daysInMonth - Array.from({ length: daysInMonth }, (_, i) => new Date(year, month - 1, i + 1).getDay()).filter((d) => d === 0).length,
+    carryInLeaves: Math.max(0, carryInLeaves),
+    remainingLeaveBalance: Math.max(0, totalPaidAllowance - paidLeavesUsed),
   };
 
   return {

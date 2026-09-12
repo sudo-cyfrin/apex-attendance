@@ -41,6 +41,17 @@ service cloud.firestore {
       allow write: if isSignedIn() && isAdmin();
     }
 
+
+    // Payroll / salary records: employees may read only their own salary;
+    // administrators may read/write all payroll records.
+    match /payroll_records/{payrollId} {
+      allow read: if isSignedIn() && (
+        isAdmin() ||
+        resource.data.userId == request.auth.uid
+      );
+      allow create, update, delete: if isAdmin();
+    }
+
     // Attendance records
     match /attendance_records/{recordId} {
       allow get: if isSignedIn() && (resource == null || resource.data.userId == request.auth.uid || isAdmin());
